@@ -1,0 +1,387 @@
+import ast
+import os
+import re
+import textwrap
+
+import pytest
+from django.test import SimpleTestCase
+from submission.views import (
+    correlate_platform_packages,
+    get_form_data,
+    get_lib_common_constants,
+    get_package_info,
+    parse_ast,
+    web_conf,
+)
+
+
+@pytest.mark.usefixtures("db")
+class TestSubmissionViews(SimpleTestCase):
+    maxDiff = None
+
+    def setUp(self):
+        self.linux_enabled = web_conf.linux.enabled
+        self.excluded_packages = web_conf.package_exclusion.packages
+        self.linux_package_dir = os.path.join(
+            os.path.abspath(os.path.dirname(__file__)), "..", "..", "analyzer", "linux", "modules", "packages"
+        )
+        self.windows_package_dir = os.path.join(
+            os.path.abspath(os.path.dirname(__file__)), "..", "..", "analyzer", "windows", "modules", "packages"
+        )
+        web_conf.linux.enabled = True
+
+    def tearDown(self):
+        web_conf.linux.enabled = self.linux_enabled
+        web_conf.package_exclusion.packages = self.excluded_packages
+
+    def find_in_list(self, regex, list_of_strings):
+        """Test if the regex matches any string in the list."""
+        pattern = re.compile(regex, flags=re.DOTALL)
+        for string in list_of_strings:
+            if pattern.match(string):
+                return True
+        return False
+
+    def one_should_match(self, regex, list_of_strings):
+        """One of the strings should match."""
+        found = self.find_in_list(regex, list_of_strings)
+        self.assertTrue(found, f"No string matched <{regex}>")
+
+    def none_should_match(self, regex, list_of_strings):
+        """None of the strings should match."""
+        found = self.find_in_list(regex, list_of_strings)
+        self.assertFalse(found, f"One or more strings matched <{regex}>")
+
+    def test_submission_page(self):
+        """The submission page should have a package selection form.
+
+        The form should have a list of at least 10 options.
+        """
+        submission_page = self.client.get("/submit/#file")
+        self.assertIsNotNone(submission_page.content)
+        self.assertIn("Analysis Package", submission_page.content.decode())
+        pattern = re.compile(
+            r'<select(?=[^>]*\bid="form_package")(?=[^>]*\bname="package")(?=[^>]*\bclass="[^"]*form-select)[^>]*>(.*?)</select>',
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        matches = re.findall(pattern, submission_page.content.decode())
+        self.assertEqual(len(matches), 1)
+        group0 = matches[0].strip()
+        self.assertTrue(group0.startswith("<option value"))
+        self.assertTrue(group0.endswith("</option>"))
+        option_pattern = re.compile(r"<option (.*?)</option>", flags=re.DOTALL)
+        options = re.findall(option_pattern, group0)
+        self.assertEqual('value="" title="">Detect Automatically', options[0])
+
+        self.one_should_match('value="exe" title=".*">exe - .*', options)
+        self.one_should_match(".*ichitaro.*", options)
+        self.one_should_match(".*chromium.*", options)
+        self.assertGreater(len(options), 10)
+        for opt in options:
+            self.assertTrue(opt.startswith("value="))
+
+    def test_batch_tasks_live_table_and_htmx_polling(self):
+        """GET /submit/?batch_tasks=... should return the live status table partial and stop polling when terminal."""
+        from unittest.mock import MagicMock, patch
+
+        fake_tasks = {
+            101: {
+                "id": 101,
+                "target": "/tmp/sample_a.exe",
+                "category": "file",
+                "status": "running",
+                "sample": {"sha256": "a" * 64},
+            },
+            102: {
+                "id": 102,
+                "target": "/tmp/sample_b.dll",
+                "category": "file",
+                "status": "reported",
+                "sample": {"sha256": "b" * 64},
+            },
+        }
+
+        def fake_view_task(tid, details=True):
+            data = fake_tasks.get(tid)
+            if not data:
+                return None
+            obj = MagicMock()
+            obj.to_dict.return_value = data
+            return obj
+
+        with patch("submission.views.db.view_task", side_effect=fake_view_task):
+            resp = self.client.get("/submit/?batch_tasks=101,102")
+            self.assertEqual(resp.status_code, 200)
+            html = resp.content.decode()
+            self.assertIn("sample_a.exe", html)
+            self.assertIn("sample_b.dll", html)
+            self.assertIn("RUNNING", html)
+            self.assertIn("View Report", html)
+            # Polling active while task 101 is still running
+            self.assertIn('hx-trigger="every 5s"', html)
+
+            # Once all tasks are terminal, polling stops
+            fake_tasks[101]["status"] = "reported"
+            resp_done = self.client.get("/submit/?batch_tasks=101,102")
+            html_done = resp_done.content.decode()
+            self.assertNotIn('hx-trigger="every 5s"', html_done)
+            self.assertIn("All Tasks Finished", html_done)
+
+            # Distributed status renders info badge instead of error badge
+            fake_tasks[101]["status"] = "distributed"
+            resp_dist = self.client.get("/submit/?batch_tasks=101,102")
+            self.assertIn("DISTRIBUTED", resp_dist.content.decode())
+
+            # Completed SQL status maps to PROCESSING badge (not bg-danger COMPLETED) and keeps polling
+            fake_tasks[101]["status"] = "completed"
+            resp_proc = self.client.get("/submit/?batch_tasks=101,102")
+            html_proc = resp_proc.content.decode()
+            self.assertIn("PROCESSING", html_proc)
+            self.assertNotIn("bg-danger", html_proc)
+            self.assertIn('hx-trigger="every 5s"', html_proc)
+
+        # Verify apply_sql_task_filter scoping is respected when a hook filters out tasks
+        with patch(
+            "lib.cuckoo.common.hooks.apply_sql_task_filter",
+            side_effect=lambda stmt: stmt.where(False),
+        ):
+            resp_filtered = self.client.get("/submit/?batch_tasks=101,102")
+            self.assertEqual(resp_filtered.status_code, 200)
+            self.assertNotIn("sample_a.exe", resp_filtered.content.decode())
+
+    def test_package_exclusion(self):
+        """Pick a couple of packages to exclude, to test exclusion"""
+        web_conf.package_exclusion.packages = "chromium,chromium_ext,ichitaro,shellcode"
+        submission_page = self.client.get("/submit/#file")
+        self.assertIsNotNone(submission_page.content)
+        self.assertIn("Analysis Package", submission_page.content.decode())
+        option_pattern = re.compile(r"<option (.*?)</option>", flags=re.DOTALL)
+        options = re.findall(option_pattern, submission_page.content.decode())
+        self.assertGreater(len(options), 10)
+        # excluded packages should not be listed
+        self.none_should_match(".*ichitaro.*", options)
+        self.none_should_match(".*chromium.*", options)
+        # Package 'shellcode' was excluded.
+        self.none_should_match('.*"shellcode".*', options)
+
+    def test_get_package_exe_info(self):
+        """Get the package info from exe.py."""
+        expected_options = ("str1", "str2", "str3")
+        context = {
+            "OPT_ARGUMENTS": expected_options[0],
+            "OPT_APPDATA": expected_options[1],
+            "OPT_RUNASX86": expected_options[2],
+            "ARCHIVE_OPTIONS": (1, 2),
+            "DLL_OPTIONS": (3, 4),
+        }
+        actual = get_package_info(self.windows_package_dir, "exe.py", "windows", context)
+        self.assertEqual("exe", actual["name"])
+        self.assertEqual("Exe", actual["classname"])
+        self.assertIn("summary", actual)
+        self.assertIn("description", actual)
+        self.assertEqual("Runs the supplied executable.", actual["summary"])
+        expected_description = textwrap.dedent(
+            f"""\
+        Executes the given sample, passing '{context["OPT_ARGUMENTS"]}' if specified.
+        Use the '{context["OPT_APPDATA"]}' option to run the executable from the APPDATA directory.
+        Use the '{context["OPT_RUNASX86"]}' option to set the 32BITREQUIRED flag in the PE header,
+        using 'CorFlags.exe /32bit+'.
+        The .exe extension will be added automatically.
+        OPTIONS: {expected_options}"""
+        )
+        actual_description = actual["description"]
+        self.assertEqual(expected_description, actual_description)
+        self.assertEqual(expected_options, actual["option_names"])
+
+    def test_get_package_rar_info(self):
+        """Get the package info from rar.py."""
+        context = {
+            "ARCHIVE_OPTIONS": (2, 5, 1, 3),
+            "DLL_OPTIONS": (3, 4, 2, 5),
+        }
+        actual = get_package_info(self.windows_package_dir, "rar.py", "windows", context)
+        self.assertIn("name", actual)
+        self.assertEqual("rar", actual["name"])
+        self.assertIn("summary", actual)
+        self.assertIn("description", actual)
+        self.assertIn("option_names", actual)
+        self.assertEqual([1, 2, 3, 4, 5], actual["option_names"])
+
+    def test_get_package_one(self):
+        """Get the package info from one.py."""
+        context = dict()
+        actual = get_package_info(self.windows_package_dir, "one.py", "windows", context)
+        self.assertEqual("one", actual["name"])
+        self.assertNotIn("_OPT_YARASCAN", actual["description"])
+        self.assertIn("'yarascan'", actual["description"])
+
+    def test_get_package_bash(self):
+        """Get the package info from bash.py."""
+        context = {
+            "summary": "should not be preserved",
+            "description": "should not be preserved",
+            "option_names": ("opt1", "opt2", "opt3"),
+        }
+        actual = get_package_info(self.linux_package_dir, "bash.py", "linux", context)
+        self.assertEqual("bash", actual["name"])
+        self.assertEqual("linux", actual["platform"])
+        self.assertNotEqual("should not be preserved", actual["summary"])
+        self.assertNotEqual("should not be preserved", actual["description"])
+        # The bash package does not have a summary, description, or option_names.
+        self.assertIn(" has no summary", actual["summary"])
+        self.assertIn(" has no description", actual["description"])
+        self.assertFalse(actual["option_names"])
+
+    def test_get_form_data(self):
+        """Use get_form_data() and check the values returned."""
+        packages, machines = get_form_data()
+        self.assertIsInstance(packages, list)
+        self.assertIsInstance(machines, list)
+        self.assertGreater(len(packages), 10)
+        self.assertGreater(len(machines), 0)
+        platforms = {package["platform"] for package in packages}
+        self.assertIn("windows", platforms)
+        self.assertIn("linux", platforms)
+        package_names = {package["name"] for package in packages}
+        self.assertIn("bash (linux only)", package_names)
+
+    def test_get_lib_common_constants(self):
+        """Ensure we get the constants from lib/common/constants.py"""
+        actual = get_lib_common_constants(platform="windows")
+        self.assertIsInstance(actual, dict)
+        self.assertEqual("runasx86", actual["OPT_RUNASX86"])
+        self.assertCountEqual(("file", "password", "recursion_depth", "max_executables"), actual["ARCHIVE_OPTIONS"])
+        self.assertCountEqual(("arguments", "dllloader", "function"), actual["DLL_OPTIONS"])
+        self.assertIn("SystemDrive", actual["TRUSTED_PATH_TEXT"])
+        self.assertIn("SystemDrive", actual["MSOFFICE_TRUSTED_PATH"])
+
+    def test_parse_ast(self):
+        """Test some of the parse_ast functionality."""
+        var1 = "x"
+        val1 = "value-of-x"
+
+        # Test ast.BinOp
+        code1 = f"{var1} = 'value-of-' + 'x'"
+        tree = ast.parse(code1)
+        actual = parse_ast(tree.body)
+        self.assertEqual(val1, actual[var1])
+
+        # Test ast.Name lookup from context
+        var2 = "y"
+        code2 = f"{var1} = '{val1}'\n{var2} = f'{{x}}'"
+        tree = ast.parse(code2)
+        actual = parse_ast(tree.body)
+        self.assertEqual(val1, actual[var1])
+        self.assertEqual(val1, actual[var2])
+
+        # Test ast.Tuple handling.
+        code3 = f"{var1} = (1, 2)"
+        tree = ast.parse(code3)
+        actual = parse_ast(tree.body)
+        self.assertEqual((1, 2), actual[var1])
+
+    def test_correlate_platform_packages(self):
+        """Test the correlate_platform_packages function."""
+        win_packages = [
+            {
+                "name": "firefox",
+                "summary": "opens a url with firefox",
+                "platform": "windows",
+            },
+            {
+                "name": "autoit",
+                "summary": "opens a file with autoit",
+                "platform": "windows",
+            },
+        ]
+        linux_packages = [
+            {
+                "name": "firefox",
+                "platform": "linux",
+            },
+            {
+                "name": "bash",
+                "platform": "linux",
+            },
+        ]
+        package_dict = {
+            "windows": win_packages,
+            "linux": linux_packages,
+        }
+        actual = correlate_platform_packages(package_dict)
+        self.assertEqual(3, len(actual))
+        names = [item["name"] for item in actual]
+        self.assertIn("firefox", names)
+        self.assertIn("bash (linux only)", names)
+
+    def test_submission_page_has_dropzone_and_active_tab_and_submit_btn(self):
+        resp = self.client.get("/submit/")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+        self.assertIn('id="submission-form"', body)
+        self.assertIn('name="active_tab"', body)
+        self.assertIn('id="file-dropzone"', body)
+        self.assertIn('id="selected-files-list"', body)
+        self.assertIn('id="precheck-existent-tasks"', body)
+        self.assertIn('id="submit-btn"', body)
+        self.assertIn("function resetSubmitButton()", body)
+        self.assertIn("window.addEventListener('pageshow'", body)
+
+    def test_resolve_submission_target_honors_active_tab(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from django.test import RequestFactory
+        from submission.views import _resolve_submission_target
+
+        rf = RequestFactory()
+        sample_file = SimpleUploadedFile("stale.exe", b"MZ\x90\x00")
+
+        # Without active_tab, legacy fallback prioritizes sample over url
+        req_legacy = rf.post("/submit/", data={"sample": sample_file, "url": "http://example.com/mal.exe"})
+        cat_legacy, samples_legacy = _resolve_submission_target(req_legacy)
+        self.assertEqual(cat_legacy, "sample")
+        self.assertEqual(len(samples_legacy), 1)
+
+        # With active_tab="url", the active tab wins even if a stale file input is present
+        sample_file_2 = SimpleUploadedFile("stale2.exe", b"MZ\x90\x00")
+        req_url = rf.post(
+            "/submit/",
+            data={"active_tab": "url", "sample": sample_file_2, "url": "http://example.com/mal.exe"},
+        )
+        cat_url, samples_url = _resolve_submission_target(req_url)
+        self.assertEqual(cat_url, "url")
+        self.assertEqual(samples_url, "http://example.com/mal.exe")
+
+        # With active_tab="downloading_service", hashes input is selected
+        req_dl = rf.post(
+            "/submit/",
+            data={"active_tab": "downloading_service", "url": "http://example.com/mal.exe", "hashes": "a" * 64},
+        )
+        cat_dl, samples_dl = _resolve_submission_target(req_dl)
+        self.assertEqual(cat_dl, "downloading_service")
+        self.assertEqual(samples_dl, "a" * 64)
+
+    def test_precheck_sha256_endpoint(self):
+        from unittest.mock import patch
+
+        sha256 = "a" * 64
+        orig_existent = web_conf.general.get("existent_tasks", False)
+        try:
+            web_conf.general.existent_tasks = True
+            fake_records = [
+                {
+                    "info": {"id": 42, "started": "2026-01-01 12:00:00"},
+                    "target": {"file": {"sha256": sha256}},
+                    "malfamily": "Emotet",
+                }
+            ]
+            with patch("submission.views.perform_search", return_value=fake_records) as mock_search:
+                resp = self.client.get(f"/submit/?precheck_sha256={sha256},not-a-hash")
+                self.assertEqual(resp.status_code, 200)
+                mock_search.assert_called_once()
+                body = resp.content.decode()
+                self.assertIn("Existing Analyses Found for Selected Sample(s)", body)
+                self.assertIn("Task #42", body)
+                self.assertIn("Emotet", body)
+        finally:
+            web_conf.general.existent_tasks = orig_existent
+

@@ -2,19 +2,22 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
-
 from lib.common.abstracts import Package
+from lib.common.common import check_file_extension
+from lib.common.constants import MSOFFICE_TRUSTED_PATH, TRUSTED_PATH_TEXT
+from lib.common.exceptions import CuckooPackageError
 
 
 class DOC(Package):
     """Word analysis package."""
 
-    def __init__(self, options={}, config=None):
+    default_curdir = MSOFFICE_TRUSTED_PATH
+
+    def __init__(self, options=None, config=None):
+        if options is None:
+            options = {}
         self.config = config
         self.options = options
-        self.options["office"] = "1"
 
     PATHS = [
         ("ProgramFiles", "Microsoft Office", "WINWORD.EXE"),
@@ -22,12 +25,18 @@ class DOC(Package):
         ("ProgramFiles", "Microsoft Office*", "root", "Office*", "WINWORD.EXE"),
         ("ProgramFiles", "Microsoft Office", "WORDVIEW.EXE"),
     ]
+    summary = "Opens a document file with WINWORD.EXE."
+    description = f"""Uses 'WINWORD.EXE /q', or if unavailable, 'WORDVIEW.EXE /q'.
+    {TRUSTED_PATH_TEXT}
+    The .doc filename extension will be added automatically."""
 
     def start(self, path):
-        word = self.get_path_glob("Microsoft Office Word")
-        if "." not in os.path.basename(path):
-            new_path = path + ".doc"
-            os.rename(path, new_path)
-            path = new_path
+        # Try getting winword or wordview as a backup
+        try:
+            word = self.get_path_glob("WINWORD.EXE")
+        except CuckooPackageError:
+            word = self.get_path_glob("WORDVIEW.EXE")
 
-        return self.execute(word, "\"%s\" /q" % path, path)
+        if not path.endswith((".doc", ".docx", ".docm", ".dotm", ".odt")):
+            path = check_file_extension(path, ".doc")
+        return self.execute(word, f'"{path}" /q', path)

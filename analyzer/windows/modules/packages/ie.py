@@ -2,7 +2,6 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 from lib.common.abstracts import Package
 
 
@@ -12,8 +11,10 @@ class IE(Package):
     PATHS = [
         ("ProgramFiles", "Internet Explorer", "iexplore.exe"),
     ]
+    summary = "Opens the URL in Internet Explorer."
+    description = """Uses iexplore.exe to open the supplied url."""
 
     def start(self, url):
         iexplore = self.get_path("Internet Explorer")
         # pass the URL instead of a filename in this case
-        return self.execute(iexplore, '"%s"' % url, url)
+        return self.execute(iexplore, f'"{url}"', url)

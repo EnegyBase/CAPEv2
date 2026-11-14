@@ -2,35 +2,35 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 # https://github.com/cuckoosandbox/cuckoo/blob/master/cuckoo/core/guest.py
-from __future__ import absolute_import
-import os
-import sys
-import json
-import time
-import socket
-import logging
-import datetime
-import requests
 
+import datetime
+import glob
+import json
+import logging
+import math
+import ntpath
+import os
+import shutil
+import socket
+import sys
+import time
+import timeit
+import uuid
 from io import BytesIO
-from zipfile import ZipFile, ZIP_STORED
+from zipfile import ZIP_STORED, ZipFile
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.exceptions import TimeoutError as Urllib3TimeoutError
+from urllib3.fields import RequestField
+from urllib3.util.retry import Retry
 
 from lib.cuckoo.common.config import Config, parse_options
-from lib.cuckoo.common.constants import CUCKOO_ROOT
-from lib.cuckoo.common.constants import CUCKOO_GUEST_PORT, CUCKOO_GUEST_INIT
-from lib.cuckoo.common.constants import CUCKOO_GUEST_COMPLETED
-from lib.cuckoo.common.constants import CUCKOO_GUEST_FAILED
-from lib.cuckoo.common.exceptions import (
-    CuckooMachineError,
-    CuckooGuestError,
-    CuckooOperationalError,
-    CuckooMachineSnapshotError,
-    CuckooCriticalError,
-    CuckooGuestCriticalTimeout,
-)
-from lib.cuckoo.common.utils import TimeoutServer, sanitize_filename
-from lib.cuckoo.core.resultserver import ResultServer
-from lib.cuckoo.core.database import Database
+from lib.cuckoo.common.constants import ANALYSIS_BASE_PATH, CUCKOO_GUEST_PORT, CUCKOO_ROOT
+from lib.cuckoo.common.exceptions import CuckooGuestCriticalTimeout, CuckooGuestError
+from lib.cuckoo.common.path_utils import path_exists, path_mkdir
+from lib.cuckoo.common.utils import sanitize_filename
+from lib.cuckoo.core.database import Database, run_db_unit
 
 log = logging.getLogger(__name__)
 db = Database()
@@ -39,7 +39,7 @@ cfg = Config()
 
 def analyzer_zipfile(platform):
     """Create the zip file that is sent to the Guest."""
-    t = time.time()
+    t = timeit.default_timer()
 
     zip_data = BytesIO()
     zip_file = ZipFile(zip_data, "w", ZIP_STORED)
@@ -49,9 +49,9 @@ def analyzer_zipfile(platform):
     root = os.path.join(CUCKOO_ROOT, "analyzer", platform)
     root_len = len(os.path.abspath(root))
 
-    if not os.path.exists(root):
+    if not path_exists(root):
         log.error("No valid analyzer found at path: %s", root)
-        raise CuckooGuestError("No valid analyzer found for %s platform!" % platform)
+        raise CuckooGuestError(f"No valid analyzer found for {platform} platform!")
 
     # Walk through everything inside the analyzer's folder and write
     # them to the zip archive.
@@ -61,19 +61,12 @@ def analyzer_zipfile(platform):
             path = os.path.join(root, name)
             archive_name = os.path.join(archive_root, name)
             zip_file.write(path, archive_name)
-        # ToDo remove
-        """
-        for name in os.listdir(dirpath):
-            zip_file.write(
-                os.path.join(dirpath, name), os.path.join("bin", name)
-            )
-        """
 
     zip_file.close()
     data = zip_data.getvalue()
     zip_data.close()
 
-    if time.time() - t > 10:
+    if timeit.default_timer() - t > 10:
         log.warning(
             "It took more than 10 seconds to build the Analyzer Zip for the "
             "Guest. This might be a serious performance penalty. Is your "
@@ -83,7 +76,139 @@ def analyzer_zipfile(platform):
     return data
 
 
-class GuestManager(object):
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Return True if *exc* or any nested cause/arg is a socket or HTTP timeout."""
+    seen = set()
+    stack = [exc]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, (requests.Timeout, TimeoutError, socket.timeout, Urllib3TimeoutError)):
+            return True
+        if cur.__cause__ is not None:
+            stack.append(cur.__cause__)
+        if cur.__context__ is not None:
+            stack.append(cur.__context__)
+        for arg in getattr(cur, "args", ()):
+            if isinstance(arg, BaseException):
+                stack.append(arg)
+    return False
+
+
+def _raise_guest_http_error(method: str, exc: BaseException):
+    if _is_timeout_error(exc):
+        raise CuckooGuestError(f"CAPE Agent HTTP request to {method} timed out: {exc}") from exc
+    raise CuckooGuestError(
+        "CAPE Agent failed without error status, please try "
+        "upgrading to the latest version of agent.py (>= 0.10) and "
+        f"notify us if the issue persists. Error: {exc}"
+    ) from exc
+
+
+class _MultipartFileStream:
+    """Seekable, fixed-length multipart/form-data stream over an open binary file.
+
+    Streaming chunks via ``read()`` instead of buffering the entire payload into
+    a single ``bytes`` object keeps host memory bounded and ensures Python's
+    ``socket.sendall()`` applies its socket timeout per chunk rather than as a
+    single wall-clock deadline across the entire file transfer. Implementing
+    ``__len__``, ``tell``, and ``seek`` lets ``requests`` emit ``Content-Length``
+    (avoiding HTTP/1.1 chunked transfer encoding on the HTTP/1.0 guest agent)
+    and lets ``urllib3`` rewind the body on initial connection retries.
+    """
+
+    DEFAULT_CHUNK_SIZE = 256 * 1024
+
+    def __init__(self, fields: dict, file_field: str, filename: str, file_obj, file_size: int):
+        self.boundary = uuid.uuid4().hex
+        prefix_chunks = []
+        for key, val in fields.items():
+            text_val = str(val)
+            rf = RequestField(name=key, data=text_val)
+            rf.make_multipart()
+            prefix_chunks.append(f"--{self.boundary}\r\n".encode("ascii"))
+            prefix_chunks.append(rf.render_headers().encode("utf-8"))
+            prefix_chunks.append(text_val.encode("utf-8"))
+            prefix_chunks.append(b"\r\n")
+
+        file_rf = RequestField(name=file_field, data=b"", filename=filename)
+        file_rf.make_multipart(content_type="application/octet-stream")
+        prefix_chunks.append(f"--{self.boundary}\r\n".encode("ascii"))
+        prefix_chunks.append(file_rf.render_headers().encode("utf-8"))
+
+        self._prefix = b"".join(prefix_chunks)
+        self._file_obj = file_obj
+        self._file_base = file_obj.tell()
+        self._file_size = max(0, int(file_size))
+        self._suffix = f"\r\n--{self.boundary}--\r\n".encode("ascii")
+        self._length = len(self._prefix) + self._file_size + len(self._suffix)
+        self._pos = 0
+
+    @property
+    def content_type(self) -> str:
+        return f"multipart/form-data; boundary={self.boundary}"
+
+    def __len__(self) -> int:
+        return self._length
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            new_pos = offset
+        elif whence == os.SEEK_CUR:
+            new_pos = self._pos + offset
+        elif whence == os.SEEK_END:
+            new_pos = self._length + offset
+        else:
+            raise ValueError(f"Invalid whence: {whence}")
+        if new_pos < 0:
+            raise ValueError(f"Negative seek position: {new_pos}")
+        self._pos = min(new_pos, self._length)
+        return self._pos
+
+    def read(self, size: int = -1) -> bytes:
+        if self._pos >= self._length:
+            return b""
+        if size is None or size < 0:
+            size = self.DEFAULT_CHUNK_SIZE
+
+        out = bytearray()
+        prefix_len = len(self._prefix)
+        file_end = prefix_len + self._file_size
+
+        while len(out) < size and self._pos < self._length:
+            need = size - len(out)
+            if self._pos < prefix_len:
+                take = self._prefix[self._pos : min(prefix_len, self._pos + need)]
+                out.extend(take)
+                self._pos += len(take)
+            elif self._pos < file_end:
+                file_offset = self._pos - prefix_len
+                self._file_obj.seek(self._file_base + file_offset)
+                to_read = min(need, file_end - self._pos)
+                chunk = self._file_obj.read(to_read)
+                if not chunk:
+                    # Pad with zeros if truncated concurrently so Content-Length stays exact.
+                    pad = b"\x00" * to_read
+                    out.extend(pad)
+                    self._pos += len(pad)
+                else:
+                    out.extend(chunk)
+                    self._pos += len(chunk)
+            else:
+                suffix_offset = self._pos - file_end
+                take = self._suffix[suffix_offset : suffix_offset + need]
+                out.extend(take)
+                self._pos += len(take)
+
+        return bytes(out)
+
+
+class GuestManager:
     """This class represents the new Guest Manager. It operates on the new
     Cuckoo Agent which features a more abstract but more feature-rich API."""
 
@@ -93,6 +218,7 @@ class GuestManager(object):
         self.port = CUCKOO_GUEST_PORT
         self.platform = platform
         self.task_id = task_id
+        self.task_label = str(task_id)
         self.analysis_manager = analysis_manager
         self.timeout = None
 
@@ -110,62 +236,112 @@ class GuestManager(object):
     def stop(self):
         self.do_run = False
 
-    def get(self, method, *args, **kwargs):
-        """Simple wrapper around requests.get()."""
-        do_raise = kwargs.pop("do_raise", True)
-        url = "http://%s:%s%s" % (self.ipaddr, self.port, method)
+    @staticmethod
+    def _guest_http_session():
         session = requests.Session()
         session.trust_env = False
         session.proxies = None
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=2,
+            backoff_factor=0.5,
+            # Only replay idempotent methods after a read failure. A POST may
+            # already have started the analyzer before its response is lost.
+            allowed_methods=Retry.DEFAULT_ALLOWED_METHODS,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
 
-        try:
-            r = session.get(url, *args, **kwargs)
-        except requests.ConnectionError:
-            raise CuckooGuestError(
-                "CAPE Agent failed without error status, please try "
-                "upgrading to the latest version of agent.py (>= 0.10) and "
-                "notify us if the issue persists."
-            )
+    def get(self, method, *args, **kwargs):
+        """Simple wrapper around requests.get()."""
+        do_raise = kwargs.pop("do_raise", True)
+        kwargs.setdefault("timeout", 30)
+        url = f"http://{self.ipaddr}:{self.port}{method}"
+        with self._guest_http_session() as session:
+            try:
+                r = session.get(url, *args, **kwargs)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                _raise_guest_http_error(method, e)
 
         do_raise and r.raise_for_status()
         return r
 
+    def get_status_from_db(self) -> str:
+        def _read_status():
+            # Force SQLAlchemy to dump its cache and look at the real DB
+            db.session.expire_all()
+            return db.guest_get_status(self.task_id)
+
+        status = run_db_unit(db, _read_status, f"guest status read for task {self.task_label}", logger=log)
+
+        # Handle the case where the task was already deleted by race condition
+        if status is None:
+            return "deleted"
+
+        return status
+
+    def set_status_in_db(self, status: str):
+        run_db_unit(db, lambda: db.guest_set_status(self.task_id, status), f"guest status update for task {self.task_label}", logger=log)
+
     def post(self, method, *args, **kwargs):
         """Simple wrapper around requests.post()."""
-        url = "http://%s:%s%s" % (self.ipaddr, self.port, method)
-        session = requests.Session()
-        session.trust_env = False
-        session.proxies = None
-
-        try:
-            r = session.post(url, *args, **kwargs)
-        except requests.ConnectionError:
-            raise CuckooGuestError(
-                "CAPE Agent failed without error status, please try "
-                "upgrading to the latest version of agent.py (>= 0.10) and "
-                "notify us if the issue persists."
-            )
+        kwargs.setdefault("timeout", 30)
+        url = f"http://{self.ipaddr}:{self.port}{method}"
+        with self._guest_http_session() as session:
+            try:
+                r = session.post(url, *args, **kwargs)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                _raise_guest_http_error(method, e)
 
         r.raise_for_status()
         return r
 
+    @staticmethod
+    def _upload_timeout(size_bytes: int) -> tuple[int, int]:
+        """Compute (connect_timeout, read_timeout) scaled to payload size."""
+        base_timeout = int(cfg.timeouts.get("guest_upload", 300) or 300)
+        scaled_timeout = 60 + math.ceil(max(0, int(size_bytes)) / (512 * 1024))
+        return (30, max(base_timeout, scaled_timeout))
+
+    def _store_file(self, local_path: str, guest_filepath: str, filename: str = "sample.bin"):
+        """Stream a local file to the guest /store endpoint with bounded memory."""
+        with open(local_path, "rb") as file_obj:
+            file_size = os.fstat(file_obj.fileno()).st_size
+            stream = _MultipartFileStream(
+                fields={"filepath": guest_filepath},
+                file_field="file",
+                filename=filename,
+                file_obj=file_obj,
+                file_size=file_size,
+            )
+            return self.post(
+                "/store",
+                data=stream,
+                headers={"Content-Type": stream.content_type},
+                timeout=self._upload_timeout(file_size),
+            )
+
     def wait_available(self):
         """Wait until the Virtual Machine is available for usage."""
-        end = time.time() + self.timeout
+        start = timeit.default_timer()
 
-        while db.guest_get_status(self.task_id) == "starting" and self.do_run:
+        while self.do_run and self.get_status_from_db() == "starting":
             try:
                 socket.create_connection((self.ipaddr, self.port), 1).close()
                 break
             except socket.timeout:
-                log.debug("%s: not ready yet", self.vmid)
+                log.debug("Task #%s: %s is not ready yet", self.task_id, self.vmid)
             except socket.error:
-                log.debug("%s: not ready yet", self.vmid)
+                log.debug("Task #%s: %s is not ready yet", self.task_id, self.vmid)
                 time.sleep(1)
 
-            if time.time() > end:
+            if timeit.default_timer() - start > self.timeout:
                 raise CuckooGuestCriticalTimeout(
-                    "Machine %s: the guest initialization hit the critical " "timeout, analysis aborted." % self.vmid
+                    f"Machine {self.vmid}: the guest initialization hit the critical timeout, analysis aborted"
                 )
 
     def query_environ(self):
@@ -188,7 +364,7 @@ class GuestManager(object):
 
     def determine_system_drive(self):
         if self.platform == "windows":
-            return "%s/" % self.environ["SYSTEMDRIVE"]
+            return f"{self.environ['SYSTEMDRIVE']}/"
         return "/"
 
     def determine_temp_path(self):
@@ -200,13 +376,25 @@ class GuestManager(object):
         """Upload the analyzer to the Virtual Machine."""
         zip_data = analyzer_zipfile(self.platform)
 
-        log.debug("Uploading analyzer to guest (id=%s, ip=%s, size=%d)", self.vmid, self.ipaddr, len(zip_data))
+        log.debug(
+            "Task #%s: Uploading analyzer to guest (id=%s, ip=%s, size=%d)", self.task_id, self.vmid, self.ipaddr, len(zip_data)
+        )
 
         self.determine_analyzer_path()
-        data = {
-            "dirpath": self.analyzer_path,
-        }
-        self.post("/extract", files={"zipfile": zip_data}, data=data)
+        with BytesIO(zip_data) as zip_fp:
+            stream = _MultipartFileStream(
+                fields={"dirpath": self.analyzer_path},
+                file_field="zipfile",
+                filename="analyzer.zip",
+                file_obj=zip_fp,
+                file_size=len(zip_data),
+            )
+            self.post(
+                "/extract",
+                data=stream,
+                headers={"Content-Type": stream.content_type},
+                timeout=self._upload_timeout(len(zip_data)),
+            )
 
     def add_config(self, options):
         """Upload the analysis.conf for this task to the Virtual Machine."""
@@ -216,38 +404,37 @@ class GuestManager(object):
         for key, value in options.items():
             # Encode datetime objects the way xmlrpc encodes them.
             if isinstance(value, datetime.datetime):
-                config.append("%s = %s" % (key, value.strftime("%Y%m%dT%H:%M:%S")))
+                config.append(f"{key} = {value.strftime('%Y%m%dT%H:%M:%S')}")
             else:
-                config.append("%s = %s" % (key, value))
+                config.append(f"{key} = {value}")
 
         data = {
             "filepath": os.path.join(self.analyzer_path, "analysis.conf"),
         }
         self.post("/store", files={"file": "\n".join(config)}, data=data)
 
-    def upload_support_files(self, options):
-        """ Upload supporting files from zip temp directory if they exist
-        :param options: options
-        :return:
-        """
-        log.info("Uploading support files to guest (id={}, ip={})".format(self.vmid, self.ipaddr))
-        basedir = os.path.dirname(options["target"])
+    def upload_scripts(self):
+        """Upload various scripts such as pre_script and during_scripts."""
+        log.info("Task #%s: Uploading script files to guest (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
+        # Temp File location of pre_script and during_script
+        base_dir = os.path.join("/tmp/cuckoo-tmp", str(self.task_id))
+        # File path of Analyses path. Storage of script
+        analyses_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(self.task_id), "scripts")
+        # Create folder in Analyses
+        path_mkdir(analyses_path, exist_ok=True)
 
-        for dirpath, _, files in os.walk(basedir):
-            for xf in files:
-                target = os.path.join(dirpath, xf)
-                # Copy all files except for the original target
-                if not target == options["target"]:
-                    data = {"filepath": os.path.join(self.determine_temp_path(), xf)}
-                    files = {"file": (xf, open(target, "rb"))}
-                    self.post("/store", files=files, data=data)
-        return
+        for name in glob.glob(os.path.join(base_dir, "*_script.*")):
+            # Copy file to Analyses/{task_ID}/scripts
+            shutil.copy(name, analyses_path)
+            basename = os.path.basename(name)
+            guest_filepath = os.path.join(self.determine_temp_path(), basename).replace("/", "\\")
+            self._store_file(name, guest_filepath, filename=basename)
 
     def start_analysis(self, options):
         """Start the analysis by uploading all required files.
         @param options: the task options
         """
-        log.info("Starting analysis #%s on guest (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
+        log.info("Task #%s: Starting analysis on guest (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
 
         self.options = options
         self.timeout = options["timeout"] + cfg.timeouts.critical
@@ -259,7 +446,7 @@ class GuestManager(object):
 
         # Could be beautified a bit, but basically we have to perform the
         # same check here as we did in wait_available().
-        if db.guest_get_status(self.task_id) != "starting":
+        if self.get_status_from_db() != "starting":
             return
 
         r = self.get("/", do_raise=False)
@@ -273,24 +460,24 @@ class GuestManager(object):
                 r.status_code,
                 json.dumps(dict(r.headers)),
             )
-            db.guest_set_status(self.task_id, "failed")
+            self.set_status_in_db("failed")
             return
 
         try:
             status = r.json()
             version = status.get("version")
             features = status.get("features", [])
-        except:
+        except Exception:
             log.critical(
                 "We were unable to detect Agent in the "
                 "Guest VM, are you sure you have set it up correctly? Please "
                 "go through the documentation once more and otherwise inform "
-                "the Cuckoo Developers of your issue."
+                "the Cuckoo Developers of your issue"
             )
-            db.guest_set_status(self.task_id, "failed")
+            self.set_status_in_db("failed")
             return
 
-        log.info("Guest is running CAPE Agent %s (id=%s, ip=%s)", version, self.vmid, self.ipaddr)
+        log.info("Task #%s: Guest is running CAPE Agent %s (id=%s, ip=%s)", self.task_id, version, self.vmid, self.ipaddr)
 
         # Pin the Agent to our IP address so that it is not accessible by
         # other Virtual Machines etc.
@@ -303,33 +490,54 @@ class GuestManager(object):
         # Upload the analyzer.
         self.upload_analyzer()
 
+        # Update file_name in options if category is file/archive to include task-id unique subdirectory
+        # This must be done BEFORE self.add_config(options) is called so that analysis.conf in guest has the correct path
+        if options["category"] in ("file", "archive"):
+            if "subdir_upload" in features:
+                if self.platform == "windows":
+                    options["file_name"] = f"{options['id']}\\{sanitize_filename(options['file_name'])}"
+                else:
+                    options["file_name"] = f"{options['id']}/{sanitize_filename(options['file_name'])}"
+            else:
+                options["file_name"] = sanitize_filename(options["file_name"])
+
+
         # Pass along the analysis.conf file.
         self.add_config(options)
         # Allow Auxiliary modules to prepare the Guest.
         # ToDo fix it
         # self.aux.callback("prepare_guest")
 
-        # If the target is a file, upload it to the guest.
-        if options["category"] == "file" or options["category"] == "archive":
-            data = {
-                "filepath": os.path.join(self.determine_temp_path(), options["file_name"]),
-            }
-            files = {
-                "file": ("sample.bin", open(options["target"], "rb")),
-            }
-            self.post("/store", files=files, data=data)
+        # ToDo https://github.com/kevoreilly/CAPEv2/issues/1468
+        # Lookup file if current doesn't exist in TMP anymore
+        alternative_path = False
+        if not path_exists(options["target"]):
+            with db.transaction():
+                path_found = db.sample_path_by_hash(task_id=options["id"])
+            if path_found:
+                alternative_path = path_found[0]
 
-        # check for support files and upload them to guest.
-        self.upload_support_files(options)
+        sample_path = alternative_path or options["target"]
+        # If the target is a file, upload it to the guest.
+        if options["category"] in ("file", "archive"):
+            # Use the correct os.sep in the filepath based on what OS this file is destined for
+            if self.platform == "windows":
+                filepath = ntpath.join(self.determine_temp_path(), options["file_name"])
+            else:
+                filepath = os.path.join(self.determine_temp_path(), options["file_name"])
+            self._store_file(sample_path, filepath, filename="sample.bin")
+
+        # upload additional scripts
+        self.upload_scripts()
 
         # Debug analyzer.py in vm
         if "CAPE_DBG" in os.environ:
-            while True:
-                pass
+            # change this to input so we can resume
+            input("CAPE DBG enabled. Introduce any text to resume")
 
         if "execpy" in features:
             data = {
-                "filepath": "%s/analyzer.py" % self.analyzer_path,
+                "filepath": os.path.join(self.analyzer_path, "analyzer.py"),
                 "async": "yes",
                 "cwd": self.analyzer_path,
             }
@@ -337,48 +545,120 @@ class GuestManager(object):
         else:
             # Execute the analyzer that we just uploaded.
             data = {
-                "command": "%s %s\\analyzer.py" % (sys.executable, self.analyzer_path),
+                "command": f"{sys.executable} {self.analyzer_path}\\analyzer.py",
                 "async": "yes",
                 "cwd": self.analyzer_path,
             }
             self.post("/execute", data=data)
 
     def wait_for_completion(self):
-
         count = 0
-        end = time.time() + self.timeout
+        start = timeit.default_timer()
+        current_status = ""
+        consecutive_failures = 0
+        # --- REWORKED: TIMEOUT CALCULATION ---
+        # 1. Detect None/0: If self.timeout is missing/infinite, use system default.
+        #    This prevents "infinite patience" if the task submission was malformed.
+        effective_timeout = self.timeout
+        if not effective_timeout:
+            effective_timeout = cfg.timeouts.default
 
-        while db.guest_get_status(self.task_id) == "running" and self.do_run:
-            if count >= 5:
-                log.debug("%s: analysis #%s is still running", self.vmid, self.task_id)
-                count = 0
+        # 2. Add Critical Buffer: This is the "Grace Period" for shutdown/reporting.
+        #    e.g., 200s (analysis) + 60s (critical) = 260s Hard Limit.
+        hard_limit = effective_timeout + cfg.timeouts.critical
 
-            count += 1
+        def hard_limit_reached() -> bool:
+            elapsed = timeit.default_timer() - start
+            if elapsed <= hard_limit:
+                return False
+            log.error(
+                "Task #%s: Hard Timeout reached! (Running for %ds, Limit %ds). Agent is likely unresponsive.",
+                self.task_label,
+                elapsed,
+                hard_limit,
+            )
+            return True
+
+        def mark_failed() -> None:
+            try:
+                self.set_status_in_db("failed")
+            except Exception as e:
+                log.error("Task #%s: Unable to mark guest as failed in DB: %s", self.task_label, e)
+
+        while self.do_run:
+            # FORCE REFRESH: Tell SQLAlchemy to expire the cache and fetch fresh data
+            # Note: Depending on your exact Cuckoo version, the session access might vary.
+            # This is the generic fix:
+            try:
+                # Re-fetch the task status directly from DB logic
+                current_status = self.get_status_from_db()
+            except Exception as e:
+                # The DB read already retried once. Keep waiting through a DB outage, but still
+                # enforce the hard limit so a database that never comes back ends the analysis.
+                log.warning("Task #%s: Error reading status from DB: %s. Continuing wait...", self.task_label, e)
+                if hard_limit_reached():
+                    mark_failed()
+                    return
+                time.sleep(1)
+                continue
+
+            if current_status != "running":
+                break
+
             time.sleep(1)
+            if not self.do_run:
+                break
 
-            # If the analysis hits the critical timeout, just return straight
-            # away and try to recover the analysis results from the guest.
-            if time.time() > end:
-                log.info("%s: end of analysis reached!", self.vmid)
+            if cfg.cuckoo.machinery_screenshots:
+                if count == 0:
+                    # indicate screenshot captures have started
+                    log.info("Task #%s: Started capturing screenshots for %s", self.task_id, self.vmid)
+                self.analysis_manager.screenshot_machine()
+            count += 1
+            if count % 5 == 0:
+                log.debug("Task #%s: Analysis is still running (id=%s, ip=%s)", self.task_id, self.vmid, self.ipaddr)
+
+            # --- REWORKED: HARD STOP ENFORCEMENT ---
+            # If we exceed the (Timeout + Critical) limit, we kill the loop.
+            # This handles the case where the Agent is dead (network timeout)
+            # and the 'except' block below keeps "continuing" forever.
+            if hard_limit_reached():
+                mark_failed()
                 return
 
             try:
                 status = self.get("/status", timeout=5).json()
-            except CuckooGuestError:
-                # this might fail due to timeouts or just temporary network
-                # issues thus we don't want to abort the analysis just yet and
-                # wait for things to recover
-                log.warning("Virtual Machine /status failed. This can indicate the " "guest losing network connectivity")
+            except (CuckooGuestError, requests.exceptions.ReadTimeout) as e:
+                if not self.do_run:
+                    break
+                # Add a counter for consecutive failures
+                consecutive_failures += 1  # You need to init this to 0 outside loop
+
+                log.warning("Task #%s: Agent unreachable (%s/10). Error: %s", self.task_id, consecutive_failures, e)
+
+                # If we fail 10 times in a row (approx 10-15 seconds), give up.
+                if consecutive_failures > 10:
+                    log.error("Task #%s: Agent is dead. Virtual Machine %s /status failed. This can indicate the guest losing network connectivity. Killing analysis.", self.task_id, self.vmid)
+                    return # Or raise exception
                 continue
             except Exception as e:
-                log.error("Virtual machine /status failed. %s", e, exc_info=True)
+                if not self.do_run:
+                    break
+                log.exception("Task #%s: Virtual machine %s /status failed. %s", self.task_id, self.vmid, e)
                 continue
 
-            if status["status"] == "complete":
-                log.info("%s: analysis completed successfully", self.vmid)
-                db.guest_set_status(self.task_id, "complete")
+            if status["status"] in ("complete", "failed"):
+                completed_as = "completed successfully" if status["status"] == "complete" else "failed"
+                log.info("Task #%s: Analysis %s (id=%s, ip=%s)", self.task_id, completed_as, self.vmid, self.ipaddr)
+                self.set_status_in_db("complete")
                 return
             elif status["status"] == "exception":
-                log.warning("%s: analysis #%s caught an exception\n%s", self.vmid, self.task_id, status["description"])
-                db.guest_set_status(self.task_id, "failed")
+                log.warning(
+                    "Task #%s: Analysis caught an exception (id=%s, ip=%s)\n%s",
+                    self.task_id,
+                    self.vmid,
+                    self.ipaddr,
+                    status["description"],
+                )
+                self.set_status_in_db("failed")
                 return

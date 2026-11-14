@@ -2,7 +2,6 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 from lib.common.abstracts import Package
 
 
@@ -12,8 +11,10 @@ class Xps(Package):
     PATHS = [
         ("SystemRoot", "system32", "xpsrchvw.exe"),
     ]
+    summary = "Opens the sample file with xpsrchvw.exe."
+    description = """Uses xpsrchvw.exe to open the supplied sample."""
 
     def start(self, path):
         xpsrchvw_path = self.get_path("xpsrchvw.exe")
-        xpsrchvw_args = '"{0}"'.format(path)
+        xpsrchvw_args = f'"{path}"'
         return self.execute(xpsrchvw_path, xpsrchvw_args, path)

@@ -2,22 +2,14 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-from ctypes import (
-    Structure,
-    sizeof,
-    create_string_buffer,
-    string_at,
-    c_ubyte as BYTE,
-    c_ushort as WORD,
-    c_uint as DWORD,
-    cast,
-    pointer,
-    POINTER,
-    byref,
-)
+from ctypes import POINTER, Structure, byref, cast, create_string_buffer, pointer, sizeof, string_at
+from ctypes import c_ubyte as BYTE
+from ctypes import c_uint as DWORD
+from ctypes import c_ushort as WORD
+
 
 class GRPICONDIR(Structure):
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = [
         ("idReserved", WORD),  # must be 0
@@ -28,6 +20,7 @@ class GRPICONDIR(Structure):
 
 
 class GRPICONDIRENTRY(Structure):
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = [
         ("bWidth", BYTE),
@@ -42,6 +35,7 @@ class GRPICONDIRENTRY(Structure):
 
 
 class ICONDIR(Structure):
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = [
         ("idReserved", WORD),  # must be 0
@@ -52,6 +46,7 @@ class ICONDIR(Structure):
 
 
 class ICONDIRENTRY(Structure):
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = [
         ("bWidth", BYTE),
@@ -65,7 +60,7 @@ class ICONDIRENTRY(Structure):
     ]
 
 
-class PEGroupIconDir(object):
+class PEGroupIconDir:
     def __init__(self, data):
         self.data = data
         self.icondir = None

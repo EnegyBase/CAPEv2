@@ -3,11 +3,11 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
+import re
+
 # this is with some fixes https://github.com/kvesteri/validators/blob/master/validators/url.py
 # https://github.com/kvesteri/validators/pull/184/files
 
-import re
 
 ip_middle_octet = r"(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5]))"
 ip_last_octet = r"(?:\.(?:0|[1-9]\d?|1\d\d|2[0-4]\d|25[0-5]))"
@@ -94,7 +94,7 @@ regex = re.compile(  # noqa: W605
     # fragment
     r"(?:#\S*)?"
     r"$",
-    re.UNICODE | re.IGNORECASE
+    re.UNICODE | re.IGNORECASE,
 )
 
 pattern = re.compile(regex)
@@ -136,72 +136,71 @@ def url(value, public=True):
     if not public:
         return result
 
-    return result and not any(
-        (result.groupdict().get(key) for key in ('private_ip', 'private_host'))
-    )
+    return result and not any((result.groupdict().get(key) for key in ("private_ip", "private_host")))
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     test_urls = (
-        u'http://foobar.dk',
-        u'http://foobar.museum/foobar',
-        u'http://fo.com',
-        u'http://FOO.com',
-        u'http://foo.com/blah_blah',
-        u'http://foo.com/blah_blah/',
-        u'http://foo.com/blah_blah_(wikipedia)',
-        u'http://foo.com/blah_blah_(wikipedia)_(again)',
-        u'http://www.example.com/wpstyle/?p=364',
-        u'https://www.example.com/foo/?bar=baz&inga=42&quux',
-        u'https://www.example.com?bar=baz',
-        u'http://✪df.ws/123',
-        u'http://userid:password@example.com:8080',
-        u'http://userid:password@example.com:8080/',
-        u'http://userid@example.com',
-        u'http://userid@example.com/',
-        u'http://userid@example.com:8080',
-        u'http://userid@example.com:8080/',
-        u'http://userid:password@example.com',
-        u'http://userid:password@example.com/',
-        u'http://142.42.1.1/',
-        u'http://142.42.1.1:8080/',
-        u'http://➡.ws/䨹',
-        u'http://⌘.ws',
-        u'http://⌘.ws/',
-        u'http://foo.com/blah_(wikipedia)#cite-1',
-        u'http://foo.com/blah_(wikipedia)_blah#cite-1',
-        u'http://foo.com/unicode_(✪)_in_parens',
-        u'http://foo.com/(something)?after=parens',
-        u'http://☺.damowmow.com/',
-        u'http://code.google.com/events/#&product=browser',
-        u'http://j.mp',
-        u'ftp://foo.bar/baz',
-        u'http://foo.bar/?q=Test%20URL-encoded%20stuff',
-        u'http://مثال.إختبار',
-        u'http://例子.测试',
-        u'http://उदाहरण.परीक्षा',
-        u'http://www.😉.com',
-        u'http://😉.com/😁',
-        u'http://উদাহরণ.বাংলা',
-        u'http://xn--d5b6ci4b4b3a.xn--54b7fta0cc',
-        u'http://дом-м.рф/1/asdf',
-        u'http://xn----gtbybh.xn--p1ai/1/asdf',
-        u'http://-.~_!$&\'()*+,;=:%40:80%2f::::::@example.com',
-        u'http://1337.net',
-        u'http://a.b-c.de',
-        u'http://223.255.255.254',
-        u'http://10.1.1.0',
-        u'http://10.1.1.1',
-        u'http://10.1.1.254',
-        u'http://10.1.1.255',
-        u'http://127.0.0.1:8080',
-        u'http://127.0.10.150',
-        u'http://localhost',
-        u'http://localhost:8000',
-        u'http://[FEDC:BA98:7654:3210:FEDC:BA98:7654:3210]:80/index.html',
-        u'http://[1080:0:0:0:8:800:200C:417A]/index.html',
-        u'http://[3ffe:2a00:100:7031::1]',
-        u'http://[1080::8:800:200C:417A]/foo',
-        u'http://[::192.9.5.5]/ipng',
-        u'http://[::FFFF:129.144.52.38]:80/index.html',
-        u'http://[2010:836B:4179::836B:4179]',
+        "http://foobar.dk",
+        "http://foobar.museum/foobar",
+        "http://fo.com",
+        "http://FOO.com",
+        "http://foo.com/blah_blah",
+        "http://foo.com/blah_blah/",
+        "http://foo.com/blah_blah_(wikipedia)",
+        "http://foo.com/blah_blah_(wikipedia)_(again)",
+        "http://www.example.com/wpstyle/?p=364",
+        "https://www.example.com/foo/?bar=baz&inga=42&quux",
+        "https://www.example.com?bar=baz",
+        "http://✪df.ws/123",
+        "http://userid:password@example.com:8080",
+        "http://userid:password@example.com:8080/",
+        "http://userid@example.com",
+        "http://userid@example.com/",
+        "http://userid@example.com:8080",
+        "http://userid@example.com:8080/",
+        "http://userid:password@example.com",
+        "http://userid:password@example.com/",
+        "http://142.42.1.1/",
+        "http://142.42.1.1:8080/",
+        "http://➡.ws/䨹",
+        "http://⌘.ws",
+        "http://⌘.ws/",
+        "http://foo.com/blah_(wikipedia)#cite-1",
+        "http://foo.com/blah_(wikipedia)_blah#cite-1",
+        "http://foo.com/unicode_(✪)_in_parens",
+        "http://foo.com/(something)?after=parens",
+        "http://☺.damowmow.com/",
+        "http://code.google.com/events/#&product=browser",
+        "http://j.mp",
+        "ftp://foo.bar/baz",
+        "http://foo.bar/?q=Test%20URL-encoded%20stuff",
+        "http://مثال.إختبار",
+        "http://例子.测试",
+        "http://उदाहरण.परीक्षा",
+        "http://www.😉.com",
+        "http://😉.com/😁",
+        "http://উদাহরণ.বাংলা",
+        "http://xn--d5b6ci4b4b3a.xn--54b7fta0cc",
+        "http://дом-м.рф/1/asdf",
+        "http://xn----gtbybh.xn--p1ai/1/asdf",
+        "http://-.~_!$&'()*+,;=:%40:80%2f::::::@example.com",
+        "http://1337.net",
+        "http://a.b-c.de",
+        "http://223.255.255.254",
+        "http://10.1.1.0",
+        "http://10.1.1.1",
+        "http://10.1.1.254",
+        "http://10.1.1.255",
+        "http://127.0.0.1:8080",
+        "http://127.0.10.150",
+        "http://localhost",
+        "http://localhost:8000",
+        "http://[FEDC:BA98:7654:3210:FEDC:BA98:7654:3210]:80/index.html",
+        "http://[1080:0:0:0:8:800:200C:417A]/index.html",
+        "http://[3ffe:2a00:100:7031::1]",
+        "http://[1080::8:800:200C:417A]/foo",
+        "http://[::192.9.5.5]/ipng",
+        "http://[::FFFF:129.144.52.38]:80/index.html",
+        "http://[2010:836B:4179::836B:4179]",
     )

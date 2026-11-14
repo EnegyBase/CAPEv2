@@ -3,37 +3,38 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import json
 import logging
-import os.path
-import socket
-import tempfile
+import random
 import threading
+from contextlib import suppress
 
 from lib.cuckoo.common.config import Config
+from lib.cuckoo.common.socket_utils import DEFAULT_SOCKET_TIMEOUT, send_socket_command
 
 cfg = Config()
 router_cfg = Config("routing")
 log = logging.getLogger(__name__)
-unixpath = tempfile.NamedTemporaryFile(mode="w+", delete=True)  # tempfile.mktemp()
-lock = threading.Lock()
 
-vpns = dict()
-socks5s = dict()
+vpns = {}
+socks5s = {}
+gateways = {}            # profile-id -> profile object (.name/.interface/.rt_table/.priority)
+_gw_cursor = 0           # process-global round-robin cursor
+_gw_lock = threading.Lock()
 
 
 def _load_socks5_operational():
-
-    socks5s = dict()
+    socks5s = {}
 
     if not router_cfg.socks5.enabled:
         return socks5s
 
     try:
-        from socks5man.manager import Manager
         from socks5man.exceptions import Socks5manDatabaseError
-    except (ImportError, OSError) as e:
+        from socks5man.manager import Manager
+    except (ImportError, OSError):
+        return socks5s
+    except Exception as e:
+        log.error(e)
         return socks5s
 
     try:
@@ -46,43 +47,90 @@ def _load_socks5_operational():
                 continue
 
             socks5s[name] = socks5.to_dict()
+
+            # decode utf-8 socks5man database data
+            for k, v in socks5s[name].items():
+                if isinstance(v, (bytes, bytearray)):
+                    with suppress(UnicodeDecodeError, AttributeError):
+                        socks5s[name][k] = v.decode()
     except Socks5manDatabaseError as e:
         print(e, "you migth have an outdated database at $HOME/.socks5man")
 
     return socks5s
 
 
+# Key set in the response returned by rooter() when the rooter socket is missing or refuses connections.
+ROOTER_UNAVAILABLE = "rooter_unavailable"
+
+
+def rooter_required(routing=None) -> bool:
+    """True when the routing configuration needs a running rooter.
+
+    The default configuration (route = none, internet = none, drop = no,
+    no VPN/tor/inetsim/socks5/nexthop) runs without one.
+    """
+    routing = routing or router_cfg
+    nexthop_enabled = hasattr(routing, "nexthop") and routing.nexthop.enabled
+    internet = getattr(routing.routing, "internet", "none")
+    drop_enabled = bool(getattr(routing.routing, "drop", False))
+    return bool(
+        routing.vpn.enabled
+        or routing.tor.enabled
+        or routing.inetsim.enabled
+        or routing.socks5.enabled
+        or str(routing.routing.route).lower() not in ("none", "false")
+        or (internet and str(internet).lower() not in ("none", "false"))
+        or drop_enabled
+        or nexthop_enabled
+    )
+
+
 def rooter(command, *args, **kwargs):
-    if not os.path.exists(cfg.cuckoo.rooter):
-        log.critical("Unable to passthrough root command (%s) as the rooter " "unix socket doesn't exist.", command)
-        return
+    """Send a command to the rooter. Always returns a dict with "output" and "exception" keys.
 
-    lock.acquire()
-
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-
-    if os.path.exists(unixpath.name):
-        os.remove(unixpath.name)
-
-    s.bind(unixpath.name)
-
-    try:
-        s.connect(cfg.cuckoo.rooter)
-    except socket.error as e:
-        log.critical("Unable to passthrough root command as we're unable to connect to the rooter unix socket: %s.", e)
-        lock.release()
-        return
-
-    s.send(json.dumps({"command": command, "args": args, "kwargs": kwargs,}).encode("utf-8"))
-
-    try:
-        ret = json.loads(s.recv(0x10000))
-    except socket.timeout:
-        ret["exception"] = "rooter response timeout"
-
-    lock.release()
-
-    if ret["exception"]:
+    If the rooter cannot be reached, "exception" is set and ROOTER_UNAVAILABLE is True, so callers that
+    check "exception" fail closed instead of treating a command that never ran as a success.
+    """
+    ret = send_socket_command(
+        cfg.cuckoo.rooter, command, *args, socket_timeout=cfg.cuckoo.get("rooter_timeout", DEFAULT_SOCKET_TIMEOUT), **kwargs
+    )
+    if ret is None:
+        # send_socket_command() already logged why (socket missing or connection refused).
+        return {"output": None, "exception": f"rooter is not reachable at {cfg.cuckoo.rooter}", ROOTER_UNAVAILABLE: True}
+    if ret and ret.get("exception"):
         log.warning("Rooter returned error: %s", ret["exception"])
-
     return ret
+
+
+def _gw_live(profile):
+    """True if the profile's egress interface exists AND is administratively up. A down gateway NIC
+    must not be selected -- round-robin/random would otherwise bind a task to a dead exit. Delegates
+    to the rooter nic_up check (nic_available only proves existence, incl. DOWN links); overridable
+    in tests."""
+    resp = rooter("nic_up", str(profile.interface))
+    return bool(resp and resp.get("output"))
+
+
+def _select_gateway(route):
+    """Resolve a task route to a LIVE gateway profile, or None (=> caller fails closed).
+    route: an explicit profile id, or a default_policy token 'roundrobin'/'random'."""
+    global _gw_cursor
+    if not gateways:
+        return None
+    if route in gateways:
+        p = gateways[route]
+        return p if _gw_live(p) else None
+    live = [gateways[k] for k in gateways if _gw_live(gateways[k])]
+    if not live:
+        return None
+    if route == "random":
+        return random.choice(live)
+    if route != "roundrobin":
+        # not a gateway id, not 'random', not 'roundrobin' => unknown selector, FAIL CLOSED
+        # rather than silently treating it as roundrobin (gemini #15).
+        return None
+    # roundrobin: advance the process-global cursor under the lock
+    with _gw_lock:
+        p = live[_gw_cursor % len(live)]
+        _gw_cursor += 1
+    return p

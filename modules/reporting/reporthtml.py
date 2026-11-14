@@ -2,26 +2,46 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
-import codecs
 import base64
+import codecs
+import logging
+import os
 
 from lib.cuckoo.common.abstracts import Report
+from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import CuckooReportError
 from lib.cuckoo.common.objects import File
+from lib.cuckoo.common.path_utils import path_exists
+from web.analysis.templatetags.analysis_tags import flare_capa_attck, flare_capa_capabilities, flare_capa_mbc, malware_config
+from web.analysis.templatetags.key_tags import dict2list, getkey, parentfixup, str2list
+from web.analysis.templatetags.pdf_tags import datefmt
 
 try:
     from jinja2.environment import Environment
     from jinja2.loaders import FileSystemLoader
-    from jinja2 import UndefinedError, TemplateNotFound, TemplateSyntaxError, TemplateAssertionError
+    from jinja2.ext import Extension
+
+    class DjangoLoadExtension(Extension):
+        tags = {"load"}
+
+        def parse(self, parser):
+            next(parser.stream)
+            while parser.stream.current.type != "block_end":
+                next(parser.stream)
+            return []
 
     HAVE_JINJA2 = True
 except ImportError:
     HAVE_JINJA2 = False
 
-from web.analysis.templatetags.analysis_tags import malware_config
+log = logging.getLogger(__name__)
+
+def network_rn_func(value):
+    """get basename from path"""
+    if isinstance(value, bytes):
+        value = value.decode()
+    return list(filter(None, value.split("\r\n")))
 
 class ReportHTML(Report):
     """Stores report in HTML format."""
@@ -32,50 +52,106 @@ class ReportHTML(Report):
         @raise CuckooReportError: if fails to write report.
         """
         if not HAVE_JINJA2:
-            raise CuckooReportError("Failed to generate HTML report: " "Jinja2 Python library is not installed")
-
-        shots_path = os.path.join(self.analysis_path, "shots")
-        if os.path.exists(shots_path):
-            shots = []
-            counter = 1
-            for shot_name in os.listdir(shots_path):
-                if not shot_name.endswith(".jpg"):
-                    continue
-
-                shot_path = os.path.join(shots_path, shot_name)
-
-                if os.path.getsize(shot_path) == 0:
-                    continue
-
-                shot = {}
-                shot["id"] = os.path.splitext(File(shot_path).get_name())[0]
-                shot["data"] = base64.b64encode(open(shot_path, "rb").read()).decode("utf-8")
-                shots.append(shot)
-
-                counter += 1
-
-            shots.sort(key=lambda shot: shot["id"])
-            results["shots"] = shots
-        else:
-            results["shots"] = []
-
-        env = Environment(autoescape=True)
-        env.globals['malware_config'] = malware_config
-        env.loader = FileSystemLoader(os.path.join(CUCKOO_ROOT, "data", "html"))
+            raise CuckooReportError("Failed to generate HTML report: Jinja2 Python library is not installed")
 
         try:
-            tpl = env.get_template("report.html")
-            html = tpl.render({"results": results, "summary_report": False})
-        except UndefinedError as e:
-            raise CuckooReportError("Failed to generate summary HTML report: {} ".format(e))
-        except TemplateNotFound as e:
-            raise CuckooReportError("Failed to generate summary HTML report: {} {} ".format(e, e.name))
-        except (TemplateSyntaxError, TemplateAssertionError) as e:
-            raise CuckooReportError("Failed to generate summary HTML report: {} on {}, line {} ".format(e, e.name, e.lineno))
-        try:
-            with codecs.open(os.path.join(self.reports_path, "report.html"), "w", encoding="utf-8") as report:
-                report.write(html)
-        except (TypeError, IOError) as e:
-            raise CuckooReportError("Failed to write HTML report: %s" % e)
+            shots_path = os.path.join(self.analysis_path, "shots")
+            if path_exists(shots_path) and self.options.screenshots:
+                shots = []
+                counter = 1
+                for shot_name in os.listdir(shots_path):
+                    if not shot_name.endswith((".jpg", ".png")):
+                        continue
+
+                    shot_path = os.path.join(shots_path, shot_name)
+
+                    if os.path.getsize(shot_path) == 0:
+                        continue
+
+                    shot = {}
+                    shot["id"] = os.path.splitext(File(shot_path).get_name())[0]
+                    with open(shot_path, "rb") as f:
+                        shot["data"] = base64.b64encode(f.read()).decode()
+                    shots.append(shot)
+
+                    counter += 1
+
+                shots.sort(key=lambda shot: shot["id"])
+                results["shots"] = shots
+            else:
+                results["shots"] = []
+
+            bingraph_dict_content = {}
+            bingraph_path = os.path.join(self.analysis_path, "bingraph")
+            if path_exists(bingraph_path):
+                if "graphs" not in results:
+                    results["graphs"] = {}
+
+                for file_name in os.listdir(bingraph_path):
+                    file_path = os.path.join(bingraph_path, file_name)
+                    sha256 = os.path.basename(file_path).split("-", 1)[0]
+                    with codecs.open(file_path, "r", encoding="utf-8") as f:
+                        bingraph_dict_content[sha256] = f.read()
+
+            if bingraph_dict_content:
+                    results["graphs"]["bingraph"] = {"enabled": True, "content": bingraph_dict_content}
+
+            debugger_path = os.path.join(self.analysis_path, "debugger")
+            debugger = {}
+            if path_exists(debugger_path):
+                try:
+                    for log_file in sorted(os.listdir(debugger_path)):
+                        if not log_file.endswith(".log"):
+                            continue
+
+                        log_path = os.path.join(debugger_path, log_file)
+                        if not os.path.isfile(log_path):
+                            continue
+
+                        try:
+                            pid = log_file.strip(".log")
+                            with open(log_path, "r") as f:
+                                debugger[pid] = f.read()
+                        except (ValueError, TypeError):
+                            log.warning("Could not parse PID from debugger log file: %s", log_file)
+                except Exception as e:
+                    log.warning("Could not read debugger logs for HTML report: %s", e)
+
+            env = Environment(autoescape=True, extensions=[DjangoLoadExtension])
+            env.filters.update(
+                {
+                    "getkey": getkey,
+                    "str2list": str2list,
+                    "dict2list": dict2list,
+                    "parentfixup": parentfixup,
+                    "malware_config": malware_config,
+                    "flare_capa_capability": flare_capa_capabilities,
+                    "flare_capa_attck": flare_capa_attck,
+                    "flare_capa_mbc": flare_capa_mbc,
+                    "datefmt": datefmt,
+                    "network_rn": network_rn_func
+                }
+            )
+            env.loader = FileSystemLoader(os.path.join(CUCKOO_ROOT, "data", "html"))
+            results["local_conf"] = self.options
+            results["network_proc_map"] = Config("processing").network.process_map
+
+            try:
+                tpl = env.get_template("report.html")
+                html = tpl.render(
+                    {
+                        "results": results,
+                        "summary_report": False,
+                        "graphs": results.get("graphs", {}),
+                        "debugger": debugger,
+                    }
+                )
+                with codecs.open(os.path.join(self.reports_path, "report.html"), "w", encoding="utf-8") as report:
+                    report.write(html)
+            except Exception as e:
+                log.exception("Failed to generate HTML report: %s", e)
+
+        except Exception as e:
+            log.exception("Failed to generate HTML report: %s", e)
 
         return True

@@ -1,99 +1,112 @@
-from __future__ import absolute_import
-import os
-import imp
-import sys
-import glob
-import json
-import logging
-import tempfile
 import hashlib
-import subprocess
-from io import BytesIO
-from collections import Mapping, Iterable
+import logging
+
+# import tempfile
+from collections.abc import Iterable, Mapping
+from contextlib import suppress
+from pathlib import Path
 
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
+from lib.cuckoo.common.hooks import apply_es_filter
 from lib.cuckoo.common.objects import File
+from lib.cuckoo.common.path_utils import path_read_file
+
+try:
+    import pydeep
+
+    ssdeep_threshold = 95
+    HAVE_PYDEEP = True
+except ImportError:
+    HAVE_PYDEEP = False
+
+HAS_MWCP = False
+HAS_MALWARECONFIGS = False
+HAVE_CAPE_EXTRACTORS = False
+with suppress(ImportError):
+    from cape_parsers import load_cape_parsers, load_malwareconfig_parsers, load_mwcp_parsers  # load_malduck_parsers
+
+    HAS_MWCP = True
+    HAS_MALWARECONFIGS = True
+    HAVE_CAPE_EXTRACTORS = True
+
+mwcp_decoders = {}
+rat_decoders = {}
+cape_malware_parsers = {}
+
+# Config variables
+cfg = Config()
+repconf = Config("reporting")
+process_cfg = Config("processing")
 
 log = logging.getLogger(__name__)
 
-malware_parsers = dict()
-cape_malware_parsers = dict()
-
-# Config variables
-repconf = Config("reporting")
 
 if repconf.mongodb.enabled:
-    import pymongo
-    results_db = pymongo.MongoClient(repconf.mongodb.host, port=repconf.mongodb.port, username=repconf.mongodb.get("username", None), password=repconf.mongodb.get("password", None), authSource=repconf.mongodb.db)[repconf.mongodb.db]
+    from dev_utils.mongodb import mongo_find_one
+
+if repconf.elasticsearchdb.enabled:
+    from dev_utils.elasticsearchdb import elastic_handler, get_analysis_index
+
+    es = elastic_handler
 
 try:
     import pefile
+
     HAVE_PEFILE = True
 except ImportError:
-    print("Missed pefile library. Install it with: pip3 install pefile")
+    print("Missed pefile library. Install it with: poetry install")
     HAVE_PEFILE = False
 
-# Import All config parsers
-try:
-    import mwcp
+if process_cfg.mwcp.enabled and HAS_MWCP:
+    mwcp_decoders, mwcp = load_mwcp_parsers()
+    HAS_MWCP = bool(mwcp_decoders)
 
-    logging.getLogger("mwcp").setLevel(logging.CRITICAL)
-    mwcp.register_parser_directory(os.path.join(CUCKOO_ROOT, "modules", "processing", "parsers", "mwcp"))
-    malware_parsers = {block.name.split(".")[-1]: block.name for block in mwcp.get_parser_descriptions(config_only=False)}
-    HAS_MWCP = True
-except ImportError as e:
-    HAS_MWCP = False
-    log.info("Missed MWCP -> pip3 install git+https://github.com/Defense-Cyber-Crime-Center/DC3-MWCP\nDetails: {}".format(e))
+if not process_cfg.ratdecoders.enabled and HAS_MALWARECONFIGS:
+    HAS_MALWARECONFIGS, rat_decoders, fileparser = load_malwareconfig_parsers()
 
-try:
-    from malwareconfig import fileparser
-    from malwareconfig.modules import __decoders__, __preprocessors__
-
-    HAS_MALWARECONFIGS = True
-except ImportError:
-    HAS_MALWARECONFIGS = False
-    log.info("Missed RATDecoders -> pip3 install git+https://github.com/kevthehermit/RATDecoders")
-except Exception as e:
-    log.error(e, exc_info=True)
+HAVE_MALDUCK = False
 """
-try:
-    # https://github.com/CERT-Polska/malduck/blob/master/tests/test_extractor.py
-    from malduck import procmem, procmempe
-    from malduck.extractor import ExtractorModules, ExtractManager
-    malduck_modules = ExtractorModules(os.path.join(CUCKOO_ROOT, "modules", "processing", "parsers", "malduck"))
-    HAVE_MALDUCK = True
-except ImportError:
-    HAVE_MALDUCK = False
-    log.info("Missed MalDuck -> pip3 install git+https://github.com/CERT-Polska/malduck/")
-"""
-
-cape_decoders = os.path.join(CUCKOO_ROOT, "modules", "processing", "parsers", "CAPE")
-CAPE_DECODERS = [os.path.basename(decoder)[:-3] for decoder in glob.glob(cape_decoders + "/[!_]*.py")]
-
-for name in CAPE_DECODERS:
+# ToDo move
+if process_cfg.malduck.enabled:
     try:
-        file, pathname, description = imp.find_module(name, [cape_decoders])
-        module = imp.load_module(name, file, pathname, description)
-        cape_malware_parsers[name] = module
-    except (ImportError, IndexError) as e:
-        if "datadirs" in str(e):
-            log.error("You are using wrong pype32 library. pip3 uninstall pype32 && pip3 install -U pype32-py3")
-        log.warning("CAPE parser: No module named {} - {}".format(name, e))
+        # from malduck.extractor.loaders import load_modules
+        from malduck.extractor import ExtractManager, ExtractorModules
+        from malduck.extractor.extractor import Extractor
+        from malduck.yara import Yara
 
-parser_path = os.path.join(CUCKOO_ROOT, "modules", "processing", "parsers", "CAPE")
-if parser_path not in sys.path:
-    sys.path.append(parser_path)
+        from lib.cuckoo.common.load_extra_modules import malduck_load_decoders
 
-try:
-    from modules.processing.parsers.plugxconfig import plugx
+        malduck_rules = Yara.__new__(Yara)
+        malduck_modules = ExtractorModules.__new__(ExtractorModules)
+        # tmp_modules = load_modules(os.path.join(CUCKOO_ROOT, process_cfg.malduck.modules_path))
+        # malduck_modules_names = dict((k.rsplit(".", 1)[-1], v) for k, v in tmp_modules.items())
+        malduck_modules_names = malduck_load_decoders(CUCKOO_ROOT)
+        malduck_modules.extractors = Extractor.__subclasses__()
+        HAVE_MALDUCK = True
+        # del tmp_modules
+        assert "test_malduck" in malduck_modules_names
+    except ImportError:
+        log.info("Missed MalDuck -> pip3 install git+https://github.com/CERT-Polska/malduck/")
+"""
 
-    plugx_parser = plugx.PlugXConfig()
-except ImportError as e:
-    plugx_parser = False
-    log.error(e)
+if process_cfg.CAPE_extractors.enabled:
+    from lib.cuckoo.common.load_extra_modules import cape_load_custom_decoders
 
-processing_conf = Config("processing")
+    cape_malware_parsers = {}
+    if HAVE_CAPE_EXTRACTORS:
+        exclude_parsers = []
+        if process_cfg.CAPE_extractors.parsers:
+            exclude_parsers = [parser_name.strip() for parser_name in process_cfg.CAPE_extractors.parsers.split(",")]
+        cape_malware_parsers = load_cape_parsers(load=process_cfg.CAPE_extractors.parsers, exclude_parsers=exclude_parsers)
+    # Custom overwrites core
+    cape_malware_parsers.update(cape_load_custom_decoders(CUCKOO_ROOT))
+    if cape_malware_parsers:
+        HAVE_CAPE_EXTRACTORS = True
+    if "test cape" not in cape_malware_parsers:
+        log.info("Missed cape-parsers! Run: poetry install")
+
+
 suppress_parsing_list = ["Cerber", "Emotet_Payload", "Ursnif", "QakBot"]
 
 pe_map = {
@@ -101,54 +114,23 @@ pe_map = {
     "PE32": ": 32-bit ",
 }
 
-cfg = Config()
 BUFSIZE = int(cfg.processing.analysis_size_limit)
 
 
-def hash_file(method, path):
+def hash_file(method, path: str) -> str:
     """Calculates an hash on a file by path.
     @param method: callable hashing method
     @param path: file path
     @return: computed hash string
     """
-    f = open(path, "rb")
     h = method()
-    while True:
-        buf = f.read(BUFSIZE)
-        if not buf:
-            break
-        h.update(buf)
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(BUFSIZE)
+            if not buf:
+                break
+            h.update(buf)
     return h.hexdigest()
-
-
-def upx_harness(raw_data):
-    upxfile = tempfile.NamedTemporaryFile(delete=False)
-    upxfile.write(raw_data)
-    upxfile.close()
-    try:
-        ret = subprocess.call("(upx -d %s)" % upxfile.name, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except Exception as e:
-        log.error("CAPE: UPX Error %s", e)
-        os.unlink(upxfile.name)
-        return
-
-    if ret == 0:
-        sha256 = hash_file(hashlib.sha256, upxfile.name)
-        newname = os.path.join(os.path.dirname(upxfile.name), sha256)
-        os.rename(upxfile.name, newname)
-        log.info("CAPE: UPX - Statically unpacked binary %s.", upxfile.name)
-        return newname
-    elif ret == 127:
-        log.error("CAPE: Error - UPX not installed.")
-    elif ret == 1:
-        log.error("CAPE: Error - UPX CantUnpackException")
-    elif ret == 2:
-        log.error("CAPE: Error - UPX 'not packed' exception.")
-    else:
-        log.error("CAPE: Unknown error - check UPX is installed and working.")
-
-    os.unlink(upxfile.name)
-    return
 
 
 def convert(data):
@@ -158,124 +140,285 @@ def convert(data):
         return dict(list(map(convert, data.items())))
     elif isinstance(data, Iterable):
         return type(data)(list(map(convert, data)))
-    else:
-        return data
+    return data
 
 
-def static_config_parsers(yara_hit, file_data):
+def is_duplicated_binary(file_info: dict, cape_file: dict, append_file: bool) -> bool:
+    """
+    Determines if a binary file is a duplicate based on various criteria.
+
+    Args:
+        file_info (dict): Information about the file being checked.
+        cape_file (dict): Information about the existing CAPE file.
+        append_file (bool): Flag indicating whether to append the file.
+
+    Returns:
+        bool: False if the file is determined to be a duplicate, otherwise returns the value of append_file.
+    """
+    if HAVE_PYDEEP:
+        ssdeep_grade = pydeep.compare(file_info["ssdeep"].encode(), cape_file["ssdeep"].encode())
+        if ssdeep_grade >= ssdeep_threshold:
+            log.debug("Duplicate payload skipped: ssdeep grade %d, threshold %d", ssdeep_grade, ssdeep_threshold)
+            append_file = False
+    if not file_info.get("pe") or not cape_file.get("pe"):
+        return append_file
+    if file_info["pe"].get("entrypoint") and file_info["pe"].get("ep_bytes") and cape_file["pe"].get("entrypoint"):
+        if (
+            file_info["pe"]["entrypoint"] == cape_file["pe"]["entrypoint"]
+            and file_info["cape_type_code"] == cape_file["cape_type_code"]
+            and file_info["pe"]["ep_bytes"] == cape_file["pe"]["ep_bytes"]
+        ):
+            log.debug("CAPE duplicate output file skipped: matching entrypoint")
+            append_file = False
+
+    return append_file
+
+
+def static_config_parsers(cape_name: str, file_path: str, file_data: bytes) -> dict:
+    """
+    Process CAPE Yara hits and extract configuration data using various parsers.
+
+    This function attempts to extract configuration data from a given file using different parsers
+    such as CAPE extractors, DC3-MWCP, and Malwareconfigs. The function returns a dictionary containing
+    the extracted configuration data.
+
+    Args:
+        cape_name (str): The name of the CAPE parser to use.
+        file_path (str): The path to the file being analyzed.
+        file_data (bytes): The binary data of the file being analyzed.
+
+    Returns:
+        dict: A dictionary containing the extracted configuration data. If no configuration data is
+            extracted, an empty dictionary is returned.
+    """
     """Process CAPE Yara hits"""
-    cape_name = yara_hit.replace("_", " ")
-    cape_config = dict()
-    cape_config[cape_name] = dict()
+    cape_config = {}
     parser_loaded = False
+    # CAPE - pure python parsers
+    # MWCP
+    # RatDecoders
+    # MalDuck
     # Attempt to import a parser for the hit
-    # DC3-MWCP
-
-    if cape_name and HAS_MWCP and cape_name in malware_parsers:
+    if HAVE_CAPE_EXTRACTORS and cape_name in cape_malware_parsers:
+        log.debug("Running CAPE parser for %s on %s", cape_name, file_path)
         try:
-            reporter = mwcp.Reporter()
-            reporter.run_parser(malware_parsers[cape_name], data=file_data)
-            if not reporter.errors:
+            # changed from cape_config to cape_configraw because of avoiding overridden. duplicated value name.
+            if hasattr(cape_malware_parsers[cape_name], "extract_config"):
+                cape_configraw = cape_malware_parsers[cape_name].extract_config(file_data)
+            else:
+                cape_configraw = cape_malware_parsers[cape_name].config(file_data)
+            if isinstance(cape_configraw, list):
+                for key, value in cape_configraw[0].items():
+                    # python3 map object returns iterator by default, not list and not serializeable in JSON.
+                    if isinstance(value, map):
+                        value = list(value)
+                    cape_config.setdefault(cape_name, {}).update({key: [value]})
                 parser_loaded = True
-                tmp_dict = dict()
-                if reporter.metadata.get("debug"):
-                    del reporter.metadata["debug"]
-                if reporter.metadata.get("other"):
-                    for key, value in reporter.metadata["other"].items():
+            elif isinstance(cape_configraw, dict):
+                for key, value in cape_configraw.items():
+                    # python3 map object returns iterator by default, not list and not serializeable in JSON.
+                    if isinstance(value, map):
+                        value = list(value)
+                    cape_config.setdefault(cape_name, {}).update({key: [value]})
+                parser_loaded = True
+        except Exception as e:
+            log.error("CAPE: parsing error on %s with %s: %s", file_path, cape_name, e)
+
+    # DC3-MWCP
+    if HAS_MWCP and not parser_loaded and cape_name and cape_name in mwcp_decoders:
+        log.debug("Running MWCP parser for %s on %s", cape_name, file_path)
+        try:
+            report = mwcp.run(mwcp_decoders[cape_name], data=file_data)
+            reportmeta = report.as_dict_legacy()
+            if not report.errors:
+                parser_loaded = True
+                tmp_dict = {}
+                if reportmeta.get("debug"):
+                    del reportmeta["debug"]
+                if reportmeta.get("other"):
+                    for key, value in reportmeta["other"].items():
                         tmp_dict.setdefault(key, [])
                         if value not in tmp_dict[key]:
                             tmp_dict[key].append(value)
-                    del reporter.metadata["other"]
+                    del reportmeta["other"]
 
-                tmp_dict.update(reporter.metadata)
-                cape_config[cape_name] = convert(tmp_dict)
+                tmp_dict.update(reportmeta)
+                cape_config.setdefault(cape_name, {}).update(convert(tmp_dict))
                 log.debug("CAPE: DC3-MWCP parser for %s completed", cape_name)
             else:
-                error_lines = reporter.errors[0].split("\n")
+                error_lines = report.errors[0].split("\n")
                 for line in error_lines:
                     if line.startswith("ImportError: "):
-                        log.debug("CAPE: DC3-MWCP parser: %s", line.split(": ")[1])
-            reporter._Reporter__cleanup()
-            del reporter
+                        log.debug("CAPE: DC3-MWCP parser: %s", line.split(": ", 2)[1])
         except pefile.PEFormatError:
-            log.error("pefile PEFormatError")
+            log.error("pefile PEFormatError on %s", file_path)
         except Exception as e:
-            log.error("CAPE: DC3-MWCP config parsing error with {}: {}".format(cape_name, e))
+            log.error(
+                "CAPE: DC3-MWCP config parsing error on %s with %s: %s",
+                file_path,
+                cape_name,
+                str(e),
+            )
 
-    if not parser_loaded and cape_name in cape_malware_parsers:
+    elif HAS_MALWARECONFIGS and not parser_loaded and cape_name in rat_decoders:
+        log.debug("Running Malwareconfig parser for %s on %s", cape_name, file_path)
         try:
-            # changed from cape_config to cape_configraw because of avoiding overridden. duplicated value name.
-            cape_configraw = cape_malware_parsers[cape_name].config(file_data)
-            if isinstance(cape_configraw, list):
-                for (key, value) in cape_configraw[0].items():
-                    # python3 map object returns iterator by default, not list and not serializeable in JSON.
-                    if isinstance(value, map):
-                        value = list(value)
-                    cape_config[cape_name].update({key: [value]})
-            elif isinstance(cape_configraw, dict):
-                for (key, value) in cape_configraw.items():
-                    # python3 map object returns iterator by default, not list and not serializeable in JSON.
-                    if isinstance(value, map):
-                        value = list(value)
-                    cape_config[cape_name].update({key: [value]})
-        except Exception as e:
-            log.error("CAPE: parsing error with {}: {}".format(cape_name, e))
-
-    elif HAS_MALWARECONFIGS and not parser_loaded and cape_name in __decoders__:
-        try:
+            module = False
             file_info = fileparser.FileParser(rawdata=file_data)
-            module = __decoders__[file_info.malware_name]["obj"]()
-            module.set_file(file_info)
-            module.get_config()
-            malwareconfig_config = module.config
-            # ToDo remove
-            if isinstance(malwareconfig_config, list):
-                for (key, value) in malwareconfig_config[0].items():
-                    cape_config[cape_name].update({key: [value]})
-            elif isinstance(malwareconfig_config, dict):
-                for (key, value) in malwareconfig_config.items():
-                    cape_config[cape_name].update({key: [value]})
-        except Exception as e:
-            log.warning("malwareconfig parsing error with %s: %s, you should submit issue/fix to https://github.com/kevthehermit/RATDecoders/", cape_name, e,)
+            # Detects name by embed yara
+            if file_info.malware_name in rat_decoders:
+                module = rat_decoders[file_info.malware_name]["obj"]()
+            elif cape_name in rat_decoders:
+                module = rat_decoders[cape_name]["obj"]()
+            else:
+                log.warning("%s: %s wasn't matched by plugin's yara", file_path, cape_name)
 
-        if cape_name in cape_config and cape_config[cape_name] == {}:
-            return {}
+            if module:
+                module.set_file(file_info)
+                module.get_config()
+                malwareconfig_config = module.config
+                # ToDo remove
+                if isinstance(malwareconfig_config, list):
+                    for key, value in malwareconfig_config[0].items():
+                        cape_config.setdefault(cape_name, {}).update({key: [value]})
+                elif isinstance(malwareconfig_config, dict):
+                    for key, value in malwareconfig_config.items():
+                        cape_config.setdefault(cape_name, {}).update({key: [value]})
+        except Exception as e:
+            if "rules" in str(e):
+                log.warning("You probably need to compile yara-python with dotnet support")
+            else:
+                log.error(e)
+                log.warning(
+                    "malwareconfig parsing error for %s with %s: %s, you should submit issue/fix to https://github.com/kevthehermit/RATDecoders/",
+                    file_path,
+                    cape_name,
+                    str(e),
+                )
+    """
+    elif HAVE_MALDUCK and not parser_loaded and cape_name.lower() in malduck_modules_names:
+        log.debug("Running Malduck on %s", file_path)
+        if not File.yara_initialized:
+            File.init_yara()
+        # placing here due to not load yara in not related tools
+        malduck_rules.rules = File.yara_rules["CAPE"]
+        malduck_modules.rules = malduck_rules
+        ext = ExtractManager.__new__(ExtractManager)
+        ext.configs = {}
+        ext.modules = malduck_modules
+        tmp_file = tempfile.NamedTemporaryFile(delete=False)
+        tmp_file.write(file_data)
+        ext.push_file(tmp_file.name)
+        tmp_file.close()
+
+        tmp_config = ext.config
+        del ext
+        if tmp_config:
+            for key, value in tmp_config[0].items():
+                cape_config.setdefault(cape_name, {}).update({key: [value]})
+    """
 
     return cape_config
 
-def static_config_lookup(file_path, sha256=False):
-    if not sha256:
-        sha256 = hashlib.sha256(open(file_path, "rb").read()).hexdigest()
-    cape_tasks = results_db.analysis.find({"target.file.sha256": sha256}, {"CAPE.cape_config":1, "info.id": 1, "_id":0})
-    for task in cape_tasks or []:
-        if task.get("cape_config") and task["cape_config"]:
-            return task
 
-def static_extraction(path):
+def static_config_lookup(file_path: str, sha256: str = False) -> dict:
+    """
+    Look up static configuration information for a given file based on its SHA-256 hash.
+
+    This function calculates the SHA-256 hash of the file at the specified path if not provided,
+    and then queries either a MongoDB or Elasticsearch database to retrieve configuration information.
+
+    Args:
+        file_path (str): The path to the file for which to look up configuration information.
+        sha256 (str, optional): The SHA-256 hash of the file. If not provided, it will be calculated.
+
+    Returns:
+        dict or None: A dictionary containing the configuration information if found, otherwise None.
+    """
+    if not sha256:
+        with open(file_path, "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+
+    if repconf.mongodb.enabled:
+        document_dict = mongo_find_one(
+            "analysis", {"target.file.sha256": sha256}, {"CAPE.configs": 1, "info.id": 1, "_id": 0}, sort=[("_id", -1)]
+        )
+    elif repconf.elasticsearchdb.enabled:
+        hits = es.search(
+            index=get_analysis_index(),
+            body=apply_es_filter({"query": {"match": {"target.file.sha256": sha256}}}),
+            _source=["CAPE.configs", "info.id"],
+            sort={"_id": {"order": "desc"}},
+        )["hits"]["hits"]
+        document_dict = hits[0]["_source"] if hits else None
+    else:
+        document_dict = None
+
+    if not document_dict:
+        return
+
+    has_config = document_dict.get("CAPE", {}).get("configs", [])
+    if has_config:
+        return document_dict["info"]
+
+
+# add your families here, should match file name as in cape yara
+named_static_extractors = []
+
+
+def static_extraction(path: str) -> dict:
+    """
+    Extracts static configuration from a file using YARA rules and named static extractors.
+
+    Args:
+        path (str): The file path to be analyzed.
+
+    Returns:
+        dict or bool: The extracted configuration as a dictionary if successful,
+                    False if no configuration is found or an error occurs.
+
+    Raises:
+        Exception: Logs any exceptions that occur during the extraction process.
+    """
+    config = {}
     try:
         hits = File(path).get_yara(category="CAPE")
-        if not hits:
-            return False
-        # Get the file data
-        with open(path, "rb") as file_open:
-            file_data = file_open.read()
-        for hit in hits:
-            config = static_config_parsers(hit["name"], file_data)
-            if config:
-                return config
-        return False
+        path_name = Path(path).name
+        if not hits and path_name not in named_static_extractors:
+            return config
+        file_data = path_read_file(path)
+        if path_name in named_static_extractors:
+            config = static_config_parsers(path_name, path, file_data)
+        else:
+            for hit in hits:
+                cape_name = File.get_cape_name_from_yara_hit(hit)
+                config = static_config_parsers(cape_name, path, file_data)
+                if config:
+                    break
     except Exception as e:
         log.error(e)
 
-    return False
+    return config
 
-def cape_name_from_yara(details, pid, results):
+
+def cape_name_from_yara(details: dict, pid: int, results: dict) -> str:
+    """
+    Extracts the CAPE name from YARA hit details and associates it with a process ID (pid) in the results dictionary.
+
+    Args:
+        details (dict): A dictionary containing YARA hit details, expected to have a key "cape_yara" with a list of hits.
+        pid (int): The process ID to associate the CAPE name with.
+        results (dict): A dictionary to store the association between detections and process IDs.
+
+    Returns:
+        str: The CAPE name extracted from the YARA hit, or None if no CAPE name is found.
+    """
     for hit in details.get("cape_yara", []) or []:
-        if "meta" in hit and any([file_type in hit["meta"].get("cape_type", "").lower() for file_type in ("payload", "config", "loader")]):
+        if File.yara_hit_provides_detection(hit):
             if "detections2pid" not in results:
                 results.setdefault("detections2pid", {})
-            results["detections2pid"].setdefault(str(pid), list())
-            name = hit["name"].replace("_", " ")
+            results["detections2pid"].setdefault(str(pid), [])
+            name = File.get_cape_name_from_yara_hit(hit)
             if name not in results["detections2pid"][str(pid)]:
                 results["detections2pid"][str(pid)].append(name)
             return name

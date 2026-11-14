@@ -2,12 +2,12 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
 import codecs
 
 from lib.cuckoo.common.abstracts import Processing
 from lib.cuckoo.common.exceptions import CuckooProcessingError
+from lib.cuckoo.common.path_utils import path_exists
+from lib.cuckoo.common.utils import truncate_str
 from lib.cuckoo.core.database import Database
 
 
@@ -21,13 +21,16 @@ class Debug(Processing):
         self.key = "debug"
         debug = {"log": "", "errors": []}
 
-        if os.path.exists(self.log_path):
+        if path_exists(self.log_path):
             try:
-                debug["log"] = codecs.open(self.log_path, "rb", "utf-8").read()
+                buf_size = self.options.get("buffer", 8192)
+                with codecs.open(self.log_path, "rb", "utf-8") as f:
+                    content = f.read()
+                debug["log"] = truncate_str(content, buf_size)
             except ValueError as e:
-                raise CuckooProcessingError("Error decoding %s: %s" % (self.log_path, e))
+                raise CuckooProcessingError(f"Error decoding {self.log_path}: {e}") from e
             except (IOError, OSError) as e:
-                raise CuckooProcessingError("Error opening %s: %s" % (self.log_path, e))
+                raise CuckooProcessingError(f"Error opening {self.log_path}: {e}") from e
 
         for error in Database().view_errors(int(self.task["id"])):
             debug["errors"].append(error.message)

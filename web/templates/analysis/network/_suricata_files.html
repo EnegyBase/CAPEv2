@@ -1,12 +1,18 @@
 {% if suricata.files|length > 0 %}
-    <div class="alert alert-info center"><a class="btn btn-secondary btn-small" href="{% url "file" "zip" id "files" %}">Download Suri Extracted</a></div>
+    <div class="alert alert-primary center"><a class="btn btn-secondary btn-sm" href="{% url "file" "zip" id "files" %}"><span class="fas fa-download"></span> Suri Extracted</a></div>
     {% for file in suricata.files %}
-        <div class="card ">
-            <table class="table table-striped">
+        <div class="table">
+            <table class="table table-dark table-striped">
                 <tr>
                     <th style="border-top: 0;" width="15%">File name</th>
                     <td style="border-top: 0;"><b>{{file.filename}}</b></td>
                 </tr>
+                {% if settings.NETWORK_PROC_MAP %}
+                <tr>
+                    <th>Process</th>
+                    <td>{% if file.process_name %}<span class="badge bg-warning text-dark" title="PID: {{file.process_id}}">{{file.process_name}} ({{file.process_id}})</span>{% else %}<span class="text-muted">-</span>{% endif %}</td>
+                </tr>
+                {% endif %}
                 <tr>
                     <th>Expected File Size</th>
                     <td>{{file.size}} bytes</td>
@@ -114,9 +120,9 @@
                 {% endif %}
                 <tr>
                     <th></th>
-                    <td><a href="{% url "file" "suricata" info.id file.sha256 %}" class="btn btn-secondary btn-small">Download</a>
+                    <td><a href="{% url "file" "suricata" id file.sha256 %}" class="btn btn-secondary btn-sm"><span class="fas fa-download"></span></a>
                     {% if file.file_info.data %}
-                    &emsp;<a class="btn btn-secondary btn-small" data-toggle="collapse" data-target="#{{file.sha256}}">Display Text</a>
+                    &emsp;<a class="btn btn-secondary btn-sm" data-bs-toggle="collapse" data-bs-target="#{{file.sha256}}">Display Text</a>
                     {% endif %}
                     </td>
                 </tr>
@@ -129,5 +135,5 @@
         </div>
     {% endfor %}
 {% else %}
-    <div class="alert alert-info"><b>Sorry!</b> No dropped Suricata Extracted files.</div>
+    <div class="alert alert-primary"><b>Sorry!</b> No Suricata Extracted files.</div>
 {% endif %}

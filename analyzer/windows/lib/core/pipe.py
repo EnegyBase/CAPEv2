@@ -3,24 +3,44 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
+import errno
 import logging
 import socket
 import threading
-import errno
+from ctypes import addressof, byref, c_uint, c_void_p, create_string_buffer, sizeof
 
-from ctypes import create_string_buffer, c_uint, byref, sizeof, addressof
+from lib.common.defines import (
+    ADVAPI32,
+    ERROR_BROKEN_PIPE,
+    ERROR_MORE_DATA,
+    ERROR_PIPE_CONNECTED,
+    INVALID_HANDLE_VALUE,
+    KERNEL32,
+    PIPE_ACCESS_DUPLEX,
+    PIPE_ACCESS_INBOUND,
+    PIPE_READMODE_BYTE,
+    PIPE_READMODE_MESSAGE,
+    PIPE_TYPE_BYTE,
+    PIPE_TYPE_MESSAGE,
+    PIPE_UNLIMITED_INSTANCES,
+    PIPE_WAIT,
+    SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR,
+)
 
-from lib.common.defines import KERNEL32, PIPE_ACCESS_INBOUND, ERROR_MORE_DATA
-from lib.common.defines import PIPE_TYPE_BYTE, PIPE_WAIT, ERROR_PIPE_CONNECTED
-from lib.common.defines import PIPE_UNLIMITED_INSTANCES, INVALID_HANDLE_VALUE
-from lib.common.defines import FILE_FLAG_WRITE_THROUGH, PIPE_READMODE_BYTE
-from lib.common.defines import ERROR_BROKEN_PIPE, PIPE_TYPE_MESSAGE
-from lib.common.defines import PIPE_ACCESS_DUPLEX, PIPE_READMODE_MESSAGE
-from lib.common.defines import SECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, ADVAPI32
+# from lib.common.defines import FILE_FLAG_WRITE_THROUGH
+
 log = logging.getLogger(__name__)
 
 BUFSIZE = 0x10000
+# Backoff for a pipe server that cannot create its named pipe.
+PIPE_RETRY_DELAY_MS = 100
+MAX_PIPE_FAILURES = 100
 open_handles = set()
+INVALID_HANDLE_VALUE_PTR = c_void_p(-1).value
+
+# Ensure WinAPI returns/accepts proper handle-sized values on 64-bit.
+KERNEL32.CreateNamedPipeW.restype = c_void_p
 
 
 class PipeForwarder(threading.Thread):
@@ -48,30 +68,34 @@ class PipeForwarder(threading.Thread):
         success = KERNEL32.ReadFile(self.pipe_handle, byref(pid), sizeof(pid), byref(bytes_read), None)
 
         if not success or bytes_read.value != sizeof(pid):
-            log.warning("Unable to read the process identifier of this log pipe instance.")
+            log.warning("Unable to read the process identifier of this log pipe instance")
             KERNEL32.CloseHandle(self.pipe_handle)
             return
 
         if self.active.get(pid.value):
-            log.warning("A second log pipe handler for an active process is " "being requested, denying request.")
+            log.warning("A second log pipe handler for an active process is being requested, denying request")
             KERNEL32.CloseHandle(self.pipe_handle)
             return
 
-        if pid.value:
-            sock = self.sockets.get(pid.value)
-            if not sock:
-                sock = socket.create_connection(self.destination)
-                self.sockets[pid.value] = sock
+        try:
+            if pid.value:
+                sock = self.sockets.get(pid.value)
+                if not sock:
+                    sock = socket.create_connection(self.destination, timeout=60)
+                    self.sockets[pid.value] = sock
 
-            self.active[pid.value] = True
-        else:
-            sock = socket.create_connection(self.destination)
+                self.active[pid.value] = True
+            else:
+                sock = socket.create_connection(self.destination, timeout=60)
+        except OSError as e:
+            log.warning("Failed to connect log pipe socket: %s", e)
+            KERNEL32.CloseHandle(self.pipe_handle)
+            return
 
         open_handles.add(sock)
 
         while self.do_run:
-            success = KERNEL32.ReadFile(self.pipe_handle, byref(
-                buf), sizeof(buf), byref(bytes_read), None)
+            success = KERNEL32.ReadFile(self.pipe_handle, byref(buf), sizeof(buf), byref(bytes_read), None)
 
             if success or KERNEL32.GetLastError() == ERROR_MORE_DATA:
                 try:
@@ -89,8 +113,7 @@ class PipeForwarder(threading.Thread):
             elif KERNEL32.GetLastError() == ERROR_BROKEN_PIPE:
                 break
             else:
-                log.warning(
-                    "The log pipe handler has failed, last error %d.", KERNEL32.GetLastError())
+                log.warning("The log pipe handler has failed, last error %d", KERNEL32.GetLastError())
                 break
 
         if pid.value:
@@ -111,19 +134,24 @@ class PipeDispatcher(threading.Thread):
         self.do_run = True
 
     def _read_message(self, buf):
-        """Reads a message."""
+        """Reads a message.
+
+        buf.value stops at the first NUL byte and ignores bytes_read, so a
+        message containing an embedded NUL was silently truncated and the rest
+        of it was parsed as a new command. Use the length the API reports and
+        strip the trailing NUL terminator the monitor writes, which is what
+        buf.value used to remove implicitly.
+        """
         bytes_read = c_uint()
         ret = b""
 
         while True:
             success = KERNEL32.ReadFile(self.pipe_handle, byref(buf), sizeof(buf), byref(bytes_read), None)
 
-            if KERNEL32.GetLastError() == ERROR_MORE_DATA:
-                # ret += buf.raw[:bytes_read.value]
-                ret += buf.value
-            elif success:
-                # return ret + buf.raw[:bytes_read.value]
-                return ret + buf.value
+            if success:
+                return (ret + buf.raw[: bytes_read.value]).rstrip(b"\x00")
+            elif KERNEL32.GetLastError() == ERROR_MORE_DATA:
+                ret += buf.raw[: bytes_read.value]
             else:
                 return
 
@@ -141,7 +169,7 @@ class PipeDispatcher(threading.Thread):
 
             KERNEL32.WriteFile(self.pipe_handle, response, len(response), byref(bytes_written), None)
 
-        KERNEL32.CloseHandle(self.pipe_handle)
+        KERNEL32.DisconnectNamedPipe(self.pipe_handle)
 
     def stop(self):
         self.do_run = False
@@ -160,6 +188,8 @@ class PipeServer(threading.Thread):
         self.handlers = set()
 
     def run(self):
+        consecutive_failures = 0
+
         while self.do_run:
             # Create the Named Pipe.
             sd = SECURITY_DESCRIPTOR()
@@ -194,27 +224,42 @@ class PipeServer(threading.Thread):
                     byref(sa),  # None,
                 )
 
-            if pipe_handle == INVALID_HANDLE_VALUE:
-                log.warning("Error opening logging pipe server.")
+            if pipe_handle in (None, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE_PTR):
+                # Without the sleep this is a spin loop: a pipe name that can
+                # never be created (instance exhaustion, a failed security
+                # descriptor, something squatting the name) burned a core and
+                # flooded the log for the rest of the analysis.
+                consecutive_failures += 1
+                if consecutive_failures == 1:
+                    log.warning("Error opening pipe server %s, last error %d", self.pipe_name, KERNEL32.GetLastError())
+                if consecutive_failures >= MAX_PIPE_FAILURES:
+                    log.error("Giving up on pipe server %s after %d consecutive failures", self.pipe_name, consecutive_failures)
+                    return
+                KERNEL32.Sleep(PIPE_RETRY_DELAY_MS)
                 continue
+
+            consecutive_failures = 0
 
             if KERNEL32.ConnectNamedPipe(pipe_handle, None) or KERNEL32.GetLastError() == ERROR_PIPE_CONNECTED:
                 handler = self.pipe_handler(pipe_handle, **self.kwargs)
                 handler.daemon = True
                 handler.start()
+                # Handlers are kept only so stop() can reach the live ones; a
+                # long analysis with many monitored processes would otherwise
+                # accumulate finished threads here for its whole duration.
+                self.handlers = {h for h in self.handlers if h.is_alive()}
                 self.handlers.add(handler)
             else:
                 KERNEL32.CloseHandle(pipe_handle)
 
     def stop(self):
         self.do_run = False
-        for h in self.handlers:
+        for h in self.handlers.copy():
             try:
-                if h.isAlive():
+                if h.is_alive():
                     h.stop()
             except Exception as e:
-                log.error(e, exc_info=True)
-                pass
+                log.exception(e)
 
 
 def disconnect_pipes():
@@ -222,5 +267,5 @@ def disconnect_pipes():
         try:
             sock.shutdown(socket.SHUT_RDWR)
             sock.close()
-        except:
+        except Exception:
             log.exception("Could not close socket")

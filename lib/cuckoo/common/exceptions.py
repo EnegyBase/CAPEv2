@@ -15,6 +15,11 @@ class CuckooStartupError(CuckooCriticalError):
     pass
 
 
+class CuckooDatabaseInitializationError(CuckooCriticalError):
+    def __str__(self):
+        return "The database has not been initialized yet. You must call init_database before attempting to use it."
+
+
 class CuckooDatabaseError(CuckooCriticalError):
     """Cuckoo database error."""
 
@@ -27,8 +32,29 @@ class CuckooDependencyError(CuckooCriticalError):
     pass
 
 
+class CuckooRooterError(CuckooCriticalError):
+    """A rooter command failed or timed out."""
+
+    pass
+
+
 class CuckooOperationalError(Exception):
     """Cuckoo operation error."""
+
+    pass
+
+
+class CuckooVisibilityConflict(CuckooOperationalError):
+    """A visibility transition was authorized against a task state that a concurrent write changed
+    before the serialization lock was taken (optimistic compare-and-swap mismatch). The caller must
+    re-read + re-authorize and retry. Subclasses CuckooOperationalError so an un-specialized handler
+    still treats it as retryable rather than a 500."""
+
+    pass
+
+
+class CuckooUnserviceableTaskError(CuckooOperationalError):
+    """There are no machines in the pool that can service the task."""
 
     pass
 
@@ -65,6 +91,12 @@ class CuckooReportError(CuckooOperationalError):
 
 class CuckooGuestError(CuckooOperationalError):
     """Cuckoo guest agent error."""
+
+    pass
+
+
+class CuckooNetworkError(CuckooOperationalError):
+    """Network issues"""
 
     pass
 

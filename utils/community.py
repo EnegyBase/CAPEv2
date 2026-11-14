@@ -3,52 +3,193 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-import shutil
 import os
+import shutil
+import subprocess
 import sys
 import zipfile
-from io import BytesIO
-if sys.version_info[:2] < (3, 6):
-    sys.exit("You are running an incompatible version of Python, please use >= 3.6")
-import logging
-import urllib3
+from contextlib import suppress
+
+if sys.version_info[:2] < (3, 8):
+    sys.exit("You are running an incompatible version of Python, please use >= 3.8")
+
 import argparse
+import logging
 import tarfile
+import time
 from io import BytesIO
+
+import urllib3
 
 sys.path.append(os.path.join(os.path.abspath(os.path.dirname(__file__)), ".."))
 
 import lib.cuckoo.common.colors as colors
 from lib.cuckoo.common.constants import CUCKOO_ROOT
+from lib.cuckoo.common.integrations.mitre import mitre_update
+from lib.cuckoo.common.path_utils import path_exists, path_mkdir
+
+blocklist = {}
+if path_exists(os.path.join(CUCKOO_ROOT, "utils", "community_blocklist.py")):
+    from utils.community_blocklist import blocklist
 
 log = logging.getLogger(__name__)
-URL = "https://github.com/kevoreilly/community/archive/{0}.tar.gz"
 
-def flare_capa_rules():
+# Resolved once per process by core_tracked_files(). None means "could not be
+# determined"; the sentinel distinguishes that from "not looked up yet".
+_UNSET = object()
+_CORE_TRACKED_CACHE = _UNSET
+_HTTP_RETRY = urllib3.Retry(
+    total=5,
+    connect=5,
+    read=5,
+    status=5,
+    backoff_factor=2,
+    status_forcelist=(429, 500, 502, 503, 504),
+)
+
+
+def _http_client(proxy=None):
+    timeout = urllib3.Timeout(connect=15.0, read=60.0)
+    if proxy:
+        return urllib3.ProxyManager(proxy, retries=_HTTP_RETRY, timeout=timeout)
+    return urllib3.PoolManager(retries=_HTTP_RETRY, timeout=timeout)
+
+
+def flare_capa(proxy=None):
+    signature_urls = (
+        "https://github.com/mandiant/capa/raw/master/sigs/1_flare_msvc_rtf_32_64.sig",
+        "https://github.com/mandiant/capa/raw/master/sigs/2_flare_msvc_atlmfc_32_64.sig",
+        "https://github.com/mandiant/capa/raw/master/sigs/3_flare_common_libs.sig",
+    )
     try:
-        http = urllib3.PoolManager()
-        data = http.request("GET", "https://github.com/fireeye/capa-rules/archive/master.zip").data
+        http = _http_client(proxy)
+        data = http.request("GET", "https://github.com/mandiant/capa-rules/archive/master.zip").data
         dest_folder = os.path.join(CUCKOO_ROOT, "data")
         shutil.rmtree((os.path.join(dest_folder, "capa-rules-master")), ignore_errors=True)
         shutil.rmtree((os.path.join(dest_folder, "capa-rules")), ignore_errors=True)
         zipfile.ZipFile(BytesIO(data)).extractall(path=dest_folder)
         os.rename(os.path.join(dest_folder, "capa-rules-master"), os.path.join(dest_folder, "capa-rules"))
-        print("[+] FLARE CAPA rules installed")
+
+        # shutil.rmtree((os.path.join(dest_folder, "capa-signatures")), ignore_errors=True)
+        capa_sigs_path = os.path.join(dest_folder, "flare-signatures")
+        if not os.path.isdir(capa_sigs_path):
+            path_mkdir(capa_sigs_path)
+        for url in signature_urls:
+            signature_name = url.rsplit("/", 1)[-1]
+            with (
+                http.request("GET", url, preload_content=False) as sig,
+                open(os.path.join(capa_sigs_path, signature_name), "wb") as out_sig,
+            ):
+                shutil.copyfileobj(sig, out_sig)
+
+        print("[+] FLARE CAPA rules/signatures installed")
     except Exception as e:
         print(e)
 
-def install(enabled, force, rewrite, filepath):
-    if filepath and os.path.exists(filepath):
-        data = open(filepath, "rb").read()
+
+def is_blocklisted(category: str, relpath: str, filepath: str) -> bool:
+    """Is this file pinned by utils/community_blocklist.py?
+
+    The blocklist documents entries as "<category>/<path>", e.g.
+    "signatures/my_amazing_signature.py", so match against that form as well as
+    the bare path inside the category folder and the absolute destination path.
+    """
+    entries = blocklist.get(category)
+    if not entries:
+        return False
+
+    relpath = relpath.replace("\\", "/")
+    candidates = {
+        os.path.normpath(filepath),
+        os.path.normpath(relpath),
+        os.path.normpath(f"{category}/{relpath}"),
+    }
+    return any(os.path.normpath(str(entry).replace("\\", "/")) in candidates for entry in entries)
+
+
+def clean_category(folder: str) -> None:
+    """Delete the installed content of a category, rooted at CUCKOO_ROOT."""
+    target = os.path.join(CUCKOO_ROOT, folder)
+    if path_exists(target):
+        shutil.rmtree(target)
+
+
+def core_tracked_files():
+    """Paths tracked by the CAPEv2 git repository, relative to CUCKOO_ROOT.
+
+    Returns None when that cannot be determined (no git, not a checkout), in
+    which case callers must not enforce anything.
+    """
+    global _CORE_TRACKED_CACHE
+    if _CORE_TRACKED_CACHE is not _UNSET:
+        return _CORE_TRACKED_CACHE
+
+    tracked = None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", CUCKOO_ROOT, "ls-files", "-z"],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode == 0:
+            tracked = frozenset(os.path.normpath(entry) for entry in proc.stdout.decode("utf-8", "replace").split("\0") if entry)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("Unable to list files tracked by the core repository: %s", e)
+
+    _CORE_TRACKED_CACHE = tracked
+    return tracked
+
+
+def shadows_core_file(folder: str, relpath: str) -> bool:
+    """Would installing this community file replace a file shipped by CAPEv2 itself?"""
+    tracked = core_tracked_files()
+    if not tracked:
+        return False
+    return os.path.normpath(os.path.join(folder, relpath.replace("\\", "/"))) in tracked
+
+
+def install(
+    enabled,
+    force,
+    rewrite,
+    clean=False,
+    filepath: str = False,
+    access_token=None,
+    proxy=False,
+    url: str = False,
+    shadow_core: bool = False,
+):
+    if filepath and path_exists(filepath):
+        t = tarfile.TarFile.open(filepath, mode="r:gz")
     else:
-        print("Downloading modules from {0}".format(URL))
-        try:
-            http = urllib3.PoolManager()
-            data = http.request("GET", URL).data
-            t = tarfile.TarFile.open(fileobj=BytesIO(data), mode="r:gz")
-        except Exception as e:
-            print("ERROR: Unable to download archive: %s" % e)
-            sys.exit(-1)
+        print(f"Downloading modules from {url}")
+        http = _http_client(proxy)
+        headers = None
+        if access_token is not None:
+            if "github" in url:
+                headers = {"Authorization": f"token {access_token}", "User-Agent": "CAPEv2_sandbox"}
+            else:
+                headers = {"PRIVATE-TOKEN": access_token}
+
+        t = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = http.request("GET", url, headers=headers)
+                data = resp.data
+                if b"Not Found" == data or resp.status == 404:
+                    print("You don't have permissions to access this repo")
+                    return
+                t = tarfile.TarFile.open(fileobj=BytesIO(data), mode="r:gz")
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+        if t is None:
+            print("ERROR: Unable to download archive: %s" % last_err)
+            return
 
     folders = {
         "feeds": "modules/feeds",
@@ -58,66 +199,125 @@ def install(enabled, force, rewrite, filepath):
         "machinery": "modules/machinery",
         "analyzer": "analyzer",
         "data": "data",
+        "common": "lib/cuckoo/common",
+        "integrations": "lib/cuckoo/common/integrations",
+        "mitre": "data/mitre",
+        "yara": "data/yara",
+        "utils": "utils",
     }
 
     members = t.getmembers()
-    directory = members[0].name.split("/")[0]
+    directory = members[0].name.split("/", 1)[0]
+    shadowed = []
 
     for category in enabled:
         folder = folders.get(category, False)
         if not folder:
             continue
 
-        print("\nInstalling {0}".format(colors.cyan(category.upper())))
+        print(f"\nInstalling {colors.cyan(category.upper())}")
+
+        if clean:
+            print(f"\n Deleting the folder content of the category {colors.cyan(category.upper())}")
+            clean_category(folder)
 
         # E.g., "community-master/modules/signatures".
-        name_start = "%s/%s" % (directory, folder)
+        name_start = f"{directory}/{folder}"
         for member in members:
             if not member.name.startswith(name_start) or name_start == member.name:
                 continue
 
-            filepath = os.path.join(CUCKOO_ROOT, folder, member.name[len(name_start) + 1 :])
-            if member.name.endswith(".gitignore"):
+            relpath = member.name[len(name_start) + 1 :]
+            filepath = os.path.join(CUCKOO_ROOT, folder, relpath)
+            if member.name.lower().endswith((".gitignore", "readme.md", "-ci.yml")):
                 continue
 
             if member.isdir():
-                if not os.path.exists(filepath):
-                    os.mkdir(filepath)
+                if not path_exists(filepath):
+                    path_mkdir(filepath)
                 continue
 
-            if not rewrite:
-                if os.path.exists(filepath):
-                    print('File "{}" already exists, {}'.format(filepath, colors.yellow("skipped")))
-                    continue
+            if not member.isfile():
+                continue
 
             install = False
             dest_file = os.path.basename(filepath)
+            is_core = shadows_core_file(folder, relpath)
+
+            if is_blocklisted(category, relpath, filepath):
+                print(f'You have blocklisted file: {dest_file}. {colors.yellow("skipped")}')
+                continue
+
+            # A community file with the same path as a file shipped by CAPEv2 itself
+            # replaces it outright - there is no namespacing between the two. Require
+            # that to be asked for explicitly.
+            if not shadow_core and is_core:
+                print(f'File "{filepath}" is shipped by CAPEv2 itself, {colors.yellow("skipped")} (use --shadow-core)')
+                shadowed.append(os.path.join(folder, relpath))
+                continue
+
+            if not rewrite and not (shadow_core and is_core) and path_exists(filepath):
+                print(f'File "{filepath}" already exists, {colors.yellow("skipped")}')
+                continue
+
             if not force:
-                while 1:
-                    choice = input('Do you want to install file "{}"? [yes/no] '.format(dest_file))
-                    if choice.lower() == "yes":
+                while True:
+                    choice = input(f'Do you want to install file "{dest_file}"? [yes/no] ')
+                    if choice.lower() in ("y", "yes"):
                         install = True
                         break
-                    elif choice.lower() == "no":
+                    elif choice.lower() in ("n", "no"):
                         break
-                    else:
-                        continue
             else:
                 install = True
 
             if install:
-                if not os.path.exists(os.path.dirname(filepath)):
-                    os.makedirs(os.path.dirname(filepath))
+                if not path_exists(os.path.dirname(filepath)):
+                    path_mkdir(os.path.dirname(filepath))
 
-                print('File "{}" {}'.format(filepath, colors.green("installed")))
-                open(filepath, "wb").write(t.extractfile(member).read())
+                try:
+                    extracted = t.extractfile(member)
+                    if extracted is None:
+                        continue
+                    with open(filepath, "wb") as f:
+                        f.write(extracted.read())
+                    if member.mode & 0o111:
+                        os.chmod(filepath, 0o755)
+                    else:
+                        current_mode = os.stat(filepath).st_mode & 0o777
+                        if current_mode & 0o111:
+                            os.chmod(filepath, current_mode & ~0o111)
+                    print(f'File "{filepath}" {colors.green("installed")}')
+                except PermissionError:
+                    print(colors.red(f"Fix permission on: {filepath}"))
+
+    if shadowed:
+        print(colors.yellow(f"\n{len(shadowed)} community file(s) were not installed because CAPEv2 ships the same path:"))
+        for path in shadowed:
+            print(f"  {path}")
+        print("Pass --shadow-core to install them anyway, or pin them in utils/community_blocklist.py.")
+
+
+def ipinfo_asn_database_fetch(token, proxy=False):
+    if proxy:
+        http = urllib3.ProxyManager(proxy)
+    else:
+        http = urllib3.PoolManager()
+    try:
+        database = http.request("GET", "https://ipinfo.io/data/free/country_asn.mmdb", fields={"token": token}).data
+        if database:
+            with open(os.path.join(CUCKOO_ROOT, "data", "country_asn.mmdb"), "wb") as f:
+                f.write(database)
+
+    except Exception as e:
+        log.error("Can't getch asn database: %s", str(e))
 
 
 def main():
-    global URL
-
     parser = argparse.ArgumentParser()
     parser.add_argument("-a", "--all", help="Download everything", action="store_true", required=False)
+    parser.add_argument("-c", "--clean", help="Clean existing files", action="store_true", required=False)
+    parser.add_argument("-cm", "--common", help="Download CAPE common modules", action="store_true", required=False)
     parser.add_argument("-e", "--feeds", help="Download CAPE feed modules", action="store_true", required=False)
     parser.add_argument("-s", "--signatures", help="Download CAPE signatures", action="store_true", required=False)
     parser.add_argument("-p", "--processing", help="Download processing modules", action="store_true", required=False)
@@ -125,19 +325,70 @@ def main():
     parser.add_argument("-r", "--reporting", help="Download reporting modules", action="store_true", required=False)
     parser.add_argument("-an", "--analyzer", help="Download analyzer modules/binaries/etc", action="store_true", required=False)
     parser.add_argument("-data", "--data", help="Download data items", action="store_true", required=False)
-    parser.add_argument("-f", "--force", help="Install files without confirmation", action="store_true", default=False, required=False)
+    parser.add_argument("-i", "--integrations", help="Download integration items", action="store_true", required=False)
+    parser.add_argument(
+        "-f", "--force", help="Install files without confirmation", action="store_true", default=False, required=False
+    )
     parser.add_argument("-w", "--rewrite", help="Rewrite existing files", action="store_true", required=False)
+    parser.add_argument(
+        "-sc",
+        "--shadow-core",
+        help="Allow community files to replace files shipped by CAPEv2 itself (implies --rewrite for those paths)",
+        action="store_true",
+        required=False,
+    )
     parser.add_argument("-b", "--branch", help="Specify a different branch", action="store", default="master", required=False)
-    parser.add_argument("--file", help="Specify a local copy of a community .zip file", action="store", default=False, required=False)
-    parser.add_argument("-cr", "--capa-rules", help="Download capa rules", action="store_true", default=False, required=False)
+    parser.add_argument(
+        "--file", help="Specify a local copy of a community .zip file", action="store", default=False, required=False
+    )
+    parser.add_argument(
+        "-cr", "--capa-rules", help="Download capa rules and signatures", action="store_true", default=False, required=False
+    )
+    parser.add_argument("--mitre", help="Download updated MITRE JSONS", action="store_true", default=False, required=False)
+    parser.add_argument(
+        "--mitre-offline",
+        help="Download updated MITRE JSONS from community repo",
+        action="store_true",
+        default=False,
+        required=False,
+    )
+    parser.add_argument(
+        "-u", "--url", help="Download community modules from the specified url", action="store", default=None, required=False
+    )
+    parser.add_argument(
+        "-t", "--token", help="Access token to download private repositories", action="store", default=None, required=False
+    )
+    parser.add_argument("--proxy", help="Proxy to use. Ex http://127.0.0.1:8080", action="store", required=False)
+    parser.add_argument("-y", "--yara", help="Download YARA rules", action="store_true", required=False)
+    parser.add_argument("-ut", "--utils", help="Download community utilities", action="store_true", required=False)
+
+    parser.add_argument(
+        "-iasn",
+        "--ipinfo-asn",
+        help="Download ipinfo.io ASN database. provide your token as argument",
+        action="store",
+        required=False,
+    )
+
     args = parser.parse_args()
 
-    URL = URL.format(args.branch)
     enabled = []
 
     if args.all:
-        enabled = ["feeds", "processing", "signatures", "reporting", "machinery", "analyzer", "data"]
-        flare_capa_rules()
+        enabled = [
+            "feeds",
+            "processing",
+            "signatures",
+            "reporting",
+            "machinery",
+            "analyzer",
+            "data",
+            "integrations",
+            "mitre",
+            "common",
+            "utils",
+        ]
+        flare_capa(args.proxy)
     else:
         if args.feeds:
             enabled.append("feeds")
@@ -151,11 +402,32 @@ def main():
             enabled.append("machinery")
         if args.analyzer:
             enabled.append("analyzer")
+        if args.common:
+            enabled.append("common")
+        # Data contains yara
         if args.data:
             enabled.append("data")
+        elif args.yara:
+            enabled.append("yara")
+        if args.integrations:
+            enabled.append("integrations")
+        if args.mitre_offline:
+            enabled.append("mitre")
+        if args.utils:
+            enabled.append("utils")
 
     if args.capa_rules:
-        flare_capa_rules()
+        flare_capa(args.proxy)
+        if not enabled:
+            return
+
+    if args.mitre:
+        mitre_update()
+        if not enabled:
+            return
+
+    if args.ipinfo_asn:
+        ipinfo_asn_database_fetch(args.ipinfo_asn, args.proxy)
         if not enabled:
             return
 
@@ -164,12 +436,19 @@ def main():
         parser.print_help()
         return
 
-    install(enabled, args.force, args.rewrite, args.file)
+    install(
+        enabled,
+        args.force,
+        args.rewrite,
+        args.clean,
+        args.file,
+        args.token,
+        args.proxy,
+        args.url or f"https://github.com/kevoreilly/community/archive/{args.branch}.tar.gz",
+        args.shadow_core,
+    )
 
 
 if __name__ == "__main__":
-    try:
+    with suppress(KeyboardInterrupt):
         main()
-    except KeyboardInterrupt:
-        pass
-

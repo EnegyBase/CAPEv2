@@ -1,87 +1,109 @@
 # Copyright (C) 2010-2015 Cuckoo Foundation.
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
-from __future__ import absolute_import
-import sys
 import os
-
+import sys
+from contextlib import suppress
 from pathlib import Path
 
-try:
-    import re2 as re
-except ImportError:
-    import re
+if os.geteuid() == 0 and os.getenv("CAPE_AS_ROOT", "0") != "1":
+    sys.exit("Root is not allowed. You gonna break permission and other parts of CAPE. RTM!")
 
 # Cuckoo path.
-CUCKOO_PATH = os.path.join(os.getcwd(), "..")
+CUCKOO_PATH = os.path.join(os.path.abspath(os.path.dirname(__file__)), "..", "..")
 sys.path.append(CUCKOO_PATH)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+RUNNING_TESTS = "test" in sys.argv
+
+from django.core.exceptions import ImproperlyConfigured
 from lib.cuckoo.common.config import Config
 
 # In case we have VPNs enabled we need to initialize through the following
 # two methods as they verify the interaction with VPNs as well as gather
 # which VPNs are available (for representation upon File/URL submission).
+# if not RUNNING_TESTS:
 from lib.cuckoo.core.startup import init_rooter, init_routing
 
 init_rooter()
 init_routing()
 
-
 cfg = Config("reporting")
 aux_cfg = Config("auxiliary")
 web_cfg = Config("web")
 api_cfg = Config("api")
+pro_cfg = Config("processing")
 
-# Error handling for database backends
-if not cfg.mongodb.get("enabled") and not cfg.elasticsearchdb.get("enabled"):
-    raise Exception("No database backend reporting module is enabled! Please enable either ElasticSearch or MongoDB.")
+REPROCESS_TASKS = web_cfg.general.reprocess_tasks
+REPROCESS_FAILED_PROCESSING = web_cfg.general.reprocess_failed_processing
+HUNT_ENABLED = getattr(web_cfg, "hunt", {}).get("enabled", False)
+# CSRF TRUSTED ORIGINS
+# For requests that include the Origin header, Django's CSRF protection
+# requires that header match the origin present in the Host header.
 
-if cfg.mongodb.get("enabled") and cfg.elasticsearchdb.get("enabled") and not cfg.elasticsearchdb.get("searchonly"):
-    raise Exception("Both database backend reporting modules are enabled. Please only enable ElasticSearch or MongoDB.")
+csfr_list = []
+if web_cfg.security.csrf_trusted_origins:
+    for host in web_cfg.security.csrf_trusted_origins.split(","):
+        csfr_list.extend([f"http://{host}", f"https://{host}"])
+
+CSRF_TRUSTED_ORIGINS = csfr_list
+# CSRF_COOKIE_SECURE = "True"
+
+# If reporting is enabled via the web GUI, then require one of these to be enabled
+if web_cfg.web_reporting.get("enabled", True):
+    # Error handling for database backends
+    if not cfg.mongodb.get("enabled") and not cfg.elasticsearchdb.get("enabled"):
+        raise Exception("No database backend reporting module is enabled! Please enable either ElasticSearch or MongoDB.")
+
+    if cfg.mongodb.get("enabled") and cfg.elasticsearchdb.get("enabled") and not cfg.elasticsearchdb.get("searchonly"):
+        raise Exception("Both database backend reporting modules are enabled. Please only enable ElasticSearch or MongoDB.")
 
 WEB_AUTHENTICATION = web_cfg.web_auth.get("enabled", False)
 WEB_OAUTH = web_cfg.oauth
+REMOTE_SESSION = web_cfg.guacamole.enabled
 
 # Get connection options from reporting.conf.
 MONGO_HOST = cfg.mongodb.get("host", "127.0.0.1")
 MONGO_PORT = cfg.mongodb.get("port", 27017)
 MONGO_DB = cfg.mongodb.get("db", "cuckoo")
-MONGO_USER = cfg.mongodb.get("username", None)
-MONGO_PASS = cfg.mongodb.get("password", None)
+MONGO_USER = cfg.mongodb.get("username")
+MONGO_PASS = cfg.mongodb.get("password")
+MONGO_AUTHSOURCE = cfg.mongodb.get("authsource", "cuckoo")
 
 ELASTIC_HOST = cfg.elasticsearchdb.get("host", "127.0.0.1")
 ELASTIC_PORT = cfg.elasticsearchdb.get("port", 9200)
 ELASTIC_INDEX = cfg.elasticsearchdb.get("index", "cuckoo")
+ELASTIC_USER = cfg.elasticsearchdb.get("username", None)
+ELASTIC_PASS = cfg.elasticsearchdb.get("password", None)
+ELASTIC_USE_SSL = cfg.elasticsearchdb.get("use_ssl", None)
+ELASTIC_VERIFY_CERTS = cfg.elasticsearchdb.get("verify_certs", None)
 
 moloch_cfg = cfg.moloch
-vtdl_cfg = aux_cfg.virustotaldl
-zip_cfg = aux_cfg.zipped_download
+zip_cfg = web_cfg.zipped_download
 
 URL_ANALYSIS = web_cfg.url_analysis.get("enabled", False)
 DLNEXEC = web_cfg.dlnexec.get("enabled", False)
 ZIP_PWD = zip_cfg.get("zip_pwd", b"infected")
 if not isinstance(ZIP_PWD, bytes):
-    ZIP_PWD = ZIP_PWD.encode("utf-8")
-MOLOCH_BASE = moloch_cfg.get("base", None)
-MOLOCH_NODE = moloch_cfg.get("node", None)
+    ZIP_PWD = ZIP_PWD.encode()
+ZIPPED_DOWNLOAD_ALL = zip_cfg.get("download_all", False)
+MOLOCH_BASE = moloch_cfg.get("base")
+MOLOCH_NODE = moloch_cfg.get("node")
 MOLOCH_ENABLED = moloch_cfg.get("enabled", False)
-
-VTDL_ENABLED = vtdl_cfg.get("enabled", False)
-VTDL_KEY = vtdl_cfg.get("dlintelkey", None)
-VTDL_PATH = vtdl_cfg.get("dlpath", None)
-
 TEMP_PATH = Config().cuckoo.get("tmppath", "/tmp")
 
-# DEPRICATED - Enabled/Disable Zer0m0n tickbox on the submission page
+# DEPRECATED - Enabled/Disable Zer0m0n tickbox on the submission page
 OPT_ZER0M0N = False
 
 COMMENTS = web_cfg.comments.enabled
 ADMIN = web_cfg.admin.enabled
+ANON_VIEW = web_cfg.general.anon_viewable
+ALLOW_DL_REPORTS_TO_ALL = web_cfg.general.reports_dl_allowed_to_all
+NETWORK_PROC_MAP = pro_cfg.network.process_map
 
 # If false run next command
-# python3 manage.py runserver 0.0.0.0:8000 --insecure
+# python3 manage.py runserver_plus 0.0.0.0:8000 --traceback --keep-meta-shutdown
 DEBUG = True
 
 # Database settings. We don't need it.
@@ -93,19 +115,21 @@ SITE_ID = 1
 # to load the internationalization machinery.
 USE_I18N = True
 
-# If you set this to False, Django will not format dates, numbers and
-# calendars according to the current locale.
+# Deprecated in Django 5.0
+# If you set this to False, Django will not format dates, numbers and calendars according to the current locale.
 USE_L10N = True
 
 # Disabling time zone support and using local time for web interface and storage.
-# See: https://docs.djangoproject.com/en/1.5/ref/settings/#time-zone
+# https://docs.djangoproject.com/en/4.0/topics/i18n/
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = web_cfg.general.get("timezone", "UTC")
+USE_I18N = True
 USE_TZ = True
-TIME_ZONE = "UTC"
 
 # Unique secret key generator.
 # Secret key will be placed in secret_key.py file.
 try:
-    from .secret_key import *
+    from .secret_key import SECRET_KEY  # noqa: F401
 except ImportError:
     SETTINGS_DIR = os.path.abspath(os.path.dirname(__file__))
     # Using the same generation schema of Django startproject.
@@ -114,18 +138,10 @@ except ImportError:
     key = get_random_string(50, "abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*(-_=+)")
 
     # Write secret_key.py
-    with open(os.path.join(SETTINGS_DIR, "secret_key.py"), "w") as key_file:
-        key_file.write('SECRET_KEY = "{0}"'.format(key))
+    _ = Path(os.path.join(SETTINGS_DIR, "secret_key.py")).write_text(f'SECRET_KEY = "{key}"')
 
     # Reload key.
-    from secret_key import *
-
-try:
-    from captcha.fields import ReCaptchaField
-    from captcha.widgets import ReCaptchaV2Checkbox
-except ImportError:
-    sys.exit("Missed dependency: pip3 install django-recaptcha==2.0.6")
-
+    from .secret_key import SECRET_KEY  # noqa: F401
 
 # Absolute filesystem path to the directory that will hold user-uploaded files.
 # Example: "/home/media/media.lawrence.com/media/"
@@ -140,14 +156,17 @@ MEDIA_URL = ""
 # Don't put anything in this directory yourself; store your static files
 # in apps' "static/" subdirectories and in STATICFILES_DIRS.
 # Example: "/home/media/media.lawrence.com/static/"
+# When NGINX is as reverse proxy you need to put next line in local_settings.py
+# python manage.py collectstatic
 STATIC_ROOT = ""
+
 
 # URL prefix for static files.
 # Example: "http://media.lawrence.com/static/"
 STATIC_URL = "/static/"
 
 # Additional locations of static files
-STATICFILES_DIRS = (os.path.join(os.getcwd(), "static"),)
+STATICFILES_DIRS = (os.path.join(Path.cwd(), "static"),)
 
 # List of finder classes that know how to find static files in
 # various locations.
@@ -161,7 +180,9 @@ STATICFILES_FINDERS = (
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": ["templates",],
+        "DIRS": [
+            os.path.join(CUCKOO_PATH, "web", "templates"),
+        ],
         "OPTIONS": {
             "debug": True,
             "context_processors": [
@@ -174,8 +195,14 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.messages.context_processors.messages",
                 "django_settings_export.settings_export",
+                # Surfaces `may_manage_apikeys` for the API Keys link in the user dropdown.
+                "apikey.context_processors.apikey_access",
+                "guac.context_processors.guac_vnc_console",
             ],
-            "loaders": ["django.template.loaders.filesystem.Loader", "django.template.loaders.app_directories.Loader",],
+            "loaders": [
+                "django.template.loaders.filesystem.Loader",
+                "django.template.loaders.app_directories.Loader",
+            ],
         },
     },
 ]
@@ -192,24 +219,31 @@ MIDDLEWARE = [
     # Cuckoo headers.
     "web.headers.CuckooHeaders",
     #'web.middleware.ExceptionMiddleware',
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'django_otp.middleware.OTPMiddleware',
-    # in case you want custom auth, place logic in web/web/middleware.py
-    # "web.middleware.CustoAuth",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # 'django_otp.middleware.OTPMiddleware',
+    # in case you want custom auth, place logic in web/web/middleware/custom_auth.py
+    # "web.middleware.CustomAuth",
+    "web.middleware.DBTransactionMiddleware",
+    "allauth.account.middleware.AccountMiddleware",
 ]
 
-OTP_TOTP_ISSUER = 'CAPE Sandbox'
+OTP_TOTP_ISSUER = "CAPE Sandbox"
 
 # Header/protection related
 SECURE_BROWSER_XSS_FILTER = True
-X_FRAME_OPTIONS = 'DENY'
+X_FRAME_OPTIONS = "DENY"
 
 ROOT_URLCONF = "web.urls"
 
-# Python dotted path to the WSGI application used by Django's runserver.
+# Python dotted path to the WSGI application used by Django's runserver_plus.
 WSGI_APPLICATION = "web.wsgi.application"
+# Ensure ASGI_APPLICATION points to your updated file
+ASGI_APPLICATION = "web.asgi.application"
 
 INSTALLED_APPS = [
+    "daphne",
+    "channels",
+    "guac",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
@@ -224,215 +258,211 @@ INSTALLED_APPS = [
     "compare",
     "apiv2",
     "users",
-
-    'django_extensions',
-    'django_otp',
-    'django_otp.plugins.otp_totp',
-
-    #allauth
-    'django.contrib.sites',
-    'allauth',
-    'allauth.account',
-    'allauth.socialaccount',
-    'allauth.socialaccount.providers.agave',
-    'allauth.socialaccount.providers.amazon',
-    'allauth.socialaccount.providers.amazon_cognito',
-    'allauth.socialaccount.providers.angellist',
-    'allauth.socialaccount.providers.apple',
-    'allauth.socialaccount.providers.asana',
-    'allauth.socialaccount.providers.auth0',
-    'allauth.socialaccount.providers.authentiq',
-    'allauth.socialaccount.providers.azure',
-    'allauth.socialaccount.providers.baidu',
-    'allauth.socialaccount.providers.basecamp',
-    'allauth.socialaccount.providers.battlenet',
-    'allauth.socialaccount.providers.bitbucket',
-    'allauth.socialaccount.providers.bitbucket_oauth2',
-    'allauth.socialaccount.providers.bitly',
-    'allauth.socialaccount.providers.box',
-    'allauth.socialaccount.providers.cern',
-    'allauth.socialaccount.providers.coinbase',
-    'allauth.socialaccount.providers.dataporten',
-    'allauth.socialaccount.providers.daum',
-    'allauth.socialaccount.providers.digitalocean',
-    'allauth.socialaccount.providers.discord',
-    'allauth.socialaccount.providers.disqus',
-    'allauth.socialaccount.providers.douban',
-    'allauth.socialaccount.providers.doximity',
-    'allauth.socialaccount.providers.draugiem',
-    'allauth.socialaccount.providers.dropbox',
-    'allauth.socialaccount.providers.dwolla',
-    'allauth.socialaccount.providers.edmodo',
-    'allauth.socialaccount.providers.edx',
-    'allauth.socialaccount.providers.eventbrite',
-    'allauth.socialaccount.providers.eveonline',
-    'allauth.socialaccount.providers.evernote',
-    'allauth.socialaccount.providers.exist',
-    'allauth.socialaccount.providers.facebook',
-    'allauth.socialaccount.providers.feedly',
-    'allauth.socialaccount.providers.figma',
-    'allauth.socialaccount.providers.fivehundredpx',
-    'allauth.socialaccount.providers.flickr',
-    'allauth.socialaccount.providers.foursquare',
-    'allauth.socialaccount.providers.fxa',
-    'allauth.socialaccount.providers.github',
-    'allauth.socialaccount.providers.gitlab',
-    'allauth.socialaccount.providers.globus',
-    'allauth.socialaccount.providers.google',
-    'allauth.socialaccount.providers.hubic',
-    'allauth.socialaccount.providers.instagram',
-    'allauth.socialaccount.providers.jupyterhub',
-    'allauth.socialaccount.providers.kakao',
-    'allauth.socialaccount.providers.keycloak',
-    'allauth.socialaccount.providers.line',
-    'allauth.socialaccount.providers.linkedin',
-    'allauth.socialaccount.providers.linkedin_oauth2',
-    'allauth.socialaccount.providers.mailchimp',
-    'allauth.socialaccount.providers.mailru',
-    'allauth.socialaccount.providers.meetup',
-    'allauth.socialaccount.providers.microsoft',
-    'allauth.socialaccount.providers.naver',
-    'allauth.socialaccount.providers.nextcloud',
-    'allauth.socialaccount.providers.odnoklassniki',
-    'allauth.socialaccount.providers.openid',
-    'allauth.socialaccount.providers.openstreetmap',
-    'allauth.socialaccount.providers.orcid',
-    'allauth.socialaccount.providers.patreon',
-    'allauth.socialaccount.providers.paypal',
-    'allauth.socialaccount.providers.persona',
-    'allauth.socialaccount.providers.pinterest',
-    'allauth.socialaccount.providers.quickbooks',
-    'allauth.socialaccount.providers.reddit',
-    'allauth.socialaccount.providers.robinhood',
-    'allauth.socialaccount.providers.salesforce',
-    'allauth.socialaccount.providers.sharefile',
-    'allauth.socialaccount.providers.shopify',
-    'allauth.socialaccount.providers.slack',
-    'allauth.socialaccount.providers.soundcloud',
-    'allauth.socialaccount.providers.spotify',
-    'allauth.socialaccount.providers.stackexchange',
-    'allauth.socialaccount.providers.steam',
-    'allauth.socialaccount.providers.stocktwits',
-    'allauth.socialaccount.providers.strava',
-    'allauth.socialaccount.providers.stripe',
-    'allauth.socialaccount.providers.telegram',
-    'allauth.socialaccount.providers.trello',
-    'allauth.socialaccount.providers.tumblr',
-    'allauth.socialaccount.providers.twentythreeandme',
-    'allauth.socialaccount.providers.twitch',
-    'allauth.socialaccount.providers.twitter',
-    'allauth.socialaccount.providers.untappd',
-    'allauth.socialaccount.providers.vimeo',
-    'allauth.socialaccount.providers.vimeo_oauth2',
-    'allauth.socialaccount.providers.vk',
-    'allauth.socialaccount.providers.weibo',
-    'allauth.socialaccount.providers.weixin',
-    'allauth.socialaccount.providers.windowslive',
-    'allauth.socialaccount.providers.xing',
-    'allauth.socialaccount.providers.yahoo',
-    'allauth.socialaccount.providers.yandex',
-    'allauth.socialaccount.providers.ynab',
-    'allauth.socialaccount.providers.zoho',
-    'allauth.socialaccount.providers.zoom',
-    'allauth.socialaccount.providers.okta',
-
+    "django_extensions",
+    # 'django_otp',
+    # 'django_otp.plugins.otp_totp',
+    # allauth
+    "django.contrib.sites",
+    "allauth",
+    "allauth.account",
+    "allauth.socialaccount",
+    # Keeping this as example but disabling as some of them has extra dependencies. Check official docs.
+    # "allauth.socialaccount.providers.github",
+    # "allauth.socialaccount.providers.gitlab",
+    # "allauth.socialaccount.providers.google",
+    # "allauth.socialaccount.providers.microsoft",
     "crispy_forms",
-    "captcha", # https://pypi.org/project/django-recaptcha/
-
+    "crispy_bootstrap4",
+    "django_recaptcha",  # https://pypi.org/project/django-recaptcha/
     "rest_framework",
-    'rest_framework.authtoken',
+    "rest_framework.authtoken",
+    # Per-user labeled API keys (multi-key, individually revocable). Lives
+    # alongside DRF's legacy `authtoken` so ApiKeyAuthentication can fall
+    # back to existing tokens for back-compat. Reference the AppConfig
+    # explicitly so its ready() (disable-cascade signal wiring) always loads.
+    "apikey.apps.ApiKeyConfig",
 ]
 
-if api_cfg.api.token_auth_enabled:
-    REST_FRAMEWORK = {
-        'DEFAULT_AUTHENTICATION_CLASSES': [
-            'rest_framework.authentication.TokenAuthentication',
-            'rest_framework.authentication.SessionAuthentication',
+# OpenID Connect (Okta / Azure AD / Auth0 / Google Workspace / Keycloak /
+# any OIDC-compliant IdP) is wired through django-allauth's generic
+# `openid_connect` provider — registered conditionally so the dependency
+# stays inert when SSO is disabled. Configure via [oauth_oidc] in web.conf.
+OIDC_CFG = getattr(web_cfg, "oauth_oidc", None)
+if OIDC_CFG is not None and OIDC_CFG.get("enabled", False):
+    _missing = [k for k in ("client_id", "client_secret", "server_url") if not (OIDC_CFG.get(k) or "").strip()]
+    if _missing:
+        raise ImproperlyConfigured(
+            f"[oauth_oidc] enabled = yes but required fields are blank: {', '.join(_missing)}. Check conf/web.conf."
+        )
+    INSTALLED_APPS.append("allauth.socialaccount.providers.openid_connect")
+    # Merge into any existing provider config instead of reassigning, so
+    # enabling OIDC doesn't clobber other providers a deployment may have set.
+    SOCIALACCOUNT_PROVIDERS = globals().get("SOCIALACCOUNT_PROVIDERS") or {}
+    SOCIALACCOUNT_PROVIDERS["openid_connect"] = {
+        # Use our subclass for process-level discovery-doc / JWKS caching.
+        "provider_class": "web.allauth_adapters.CachedOpenIDConnectProvider",
+        "APPS": [
+            {
+                "provider_id": OIDC_CFG.get("provider_id", "oidc"),
+                "name": OIDC_CFG.get("name", "OIDC"),
+                "client_id": OIDC_CFG.get("client_id", ""),
+                "secret": OIDC_CFG.get("client_secret", ""),
+                "settings": {
+                    "server_url": OIDC_CFG.get("server_url", ""),
+                },
+            }
         ],
-        'DEFAULT_PERMISSION_CLASSES': (
-            'rest_framework.permissions.IsAuthenticated',
-        ),
-        'DEFAULT_THROTTLE_CLASSES': [
-            'rest_framework.throttling.UserRateThrottle',
-            'apiv2.throttling.SubscriptionRateThrottle'
-        ],
-        'DEFAULT_THROTTLE_RATES': {
-            'user': '5/m',
-            'subscription': '5/m',
-        }
     }
+
+AUDIT_FRAMEWORK = web_cfg.audit_framework.get("enabled", False)
+
+if api_cfg.api.token_auth_enabled:
+    # Per-user labeled API keys; ApiKeyAuthentication internally falls back to
+    # DRF's legacy TokenAuthentication so tokens issued via
+    # /apiv2/api-token-auth/ keep working without migration.
+    #
+    # When SSO is enabled, scripts targeting /apiv2/ MUST present an explicit
+    # API key (Authorization: Token <key>) — we drop SessionAuthentication from
+    # the default chain so a browser session cookie issued via the IdP can't
+    # authenticate API calls. Browser-only flows (apikey list/create pages, etc.)
+    # live outside DRF and continue to use Django session auth. Specific
+    # UI-internal endpoints that legitimately need cookie auth can opt back in
+    # per-view with @authentication_classes([SessionAuthentication]).
+    _api_auth_classes = ["apikey.authentication.ApiKeyAuthentication"]
+    if not (OIDC_CFG and OIDC_CFG.get("enabled", False)):
+        # No SSO configured — keep the legacy session-cookie fallback for
+        # back-compat with deployments that script against /apiv2/ using
+        # their browser cookies.
+        _api_auth_classes.append("rest_framework.authentication.SessionAuthentication")
+    REST_FRAMEWORK = {
+        "DEFAULT_AUTHENTICATION_CLASSES": _api_auth_classes,
+        "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+    }
+
+    if api_cfg.api.ratelimit:
+        REST_FRAMEWORK.update({
+            "DEFAULT_THROTTLE_CLASSES": ["apiv2.throttling.SubscriptionRateThrottle"],
+            "DEFAULT_THROTTLE_RATES": {
+                "user": api_cfg.api.default_user_ratelimit,
+                "subscription": api_cfg.api.default_subscription_ratelimit,
+            },
+        })
 
 else:
     REST_FRAMEWORK = {
-        'DEFAULT_AUTHENTICATION_CLASSES': [],
-        'DEFAULT_PERMISSION_CLASSES': [
-            'rest_framework.permissions.AllowAny'
-        ],
+        "DEFAULT_AUTHENTICATION_CLASSES": [],
+        "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
     }
 
 TWOFA = web_cfg.web_auth.get("2fa", False)
 
 NOCAPTCHA = web_cfg.web_auth.get("captcha", False)
 # create your keys here -> https://www.google.com/recaptcha/about/
-RECAPTCHA_PRIVATE_KEY = 'TEST_PUBLIC_KEY'
-RECAPTCHA_PUBLIC_KEY = 'TEST_PRIVATE_KEY'
-RECAPTCHA_DEFAULT_ACTION = 'generic'
+# Set those in local_settings.py
+RECAPTCHA_PRIVATE_KEY = "TEST_PUBLIC_KEY"
+RECAPTCHA_PUBLIC_KEY = "TEST_PRIVATE_KEY"
+RECAPTCHA_DEFAULT_ACTION = "generic"
 RECAPTCHA_REQUIRED_SCORE = 0.85
 
-#RECAPTCHA_DOMAIN = 'www.recaptcha.net'
+# RECAPTCHA_DOMAIN = 'www.recaptcha.net'
 
-CRISPY_TEMPLATE_PACK = 'bootstrap4'
+CRISPY_TEMPLATE_PACK = "bootstrap4"
 
 AUTHENTICATION_BACKENDS = (
- #used for default signin such as loggin into admin panel
- 'django.contrib.auth.backends.ModelBackend',
-
- #used for social authentications
- 'allauth.account.auth_backends.AuthenticationBackend',
+    # used for default signin such as loggin into admin panel
+    "django.contrib.auth.backends.ModelBackend",
+    # used for social authentications
+    "allauth.account.auth_backends.AuthenticationBackend",
 )
 
 SETTINGS_EXPORT = [
-    'WEB_AUTHENTICATION',
-    'WEB_OAUTH',
+    "WEB_AUTHENTICATION",
+    "WEB_OAUTH",
+    "ZIPPED_DOWNLOAD_ALL",
+    "NETWORK_PROC_MAP",
+    "REPROCESS_TASKS",
+    "REPROCESS_FAILED_PROCESSING",
+    "AUDIT_FRAMEWORK",
+    "HUNT_ENABLED"
 ]
 
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-if web_cfg.registration.get("email_confirmation", False):
-    EMAIL_HOST = web_cfg.registration.get("email_host", False)
-    EMAIL_HOST_USER = web_cfg.registration.get("email_user", False)
-    EMAIL_HOST_PASSWORD = web_cfg.registration.get("email_password", False)
-    EMAIL_PORT = web_cfg.registration.get("email_port", 465)
-    EMAIL_TLS_SSL = web_cfg.registration.get("use_tls", False)
-    EMAIL_USE_SSL = web_cfg.registration.get("use_ssl", False)
-    SERVER_EMAIL = EMAIL_HOST_USER
-    DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+import django
+
+if django.VERSION >= (6, 1):
+    _mailer_options = {"host": "localhost", "port": 25}
+    if web_cfg.registration.get("email_confirmation", False):
+        _email_user = web_cfg.registration.get("email_user", "") or ""
+        _mailer_options = {
+            "host": web_cfg.registration.get("email_host", "") or "localhost",
+            "username": _email_user,
+            "password": web_cfg.registration.get("email_password", "") or "",
+            "port": web_cfg.registration.get("email_port", 465),
+            "use_tls": bool(web_cfg.registration.get("use_tls", False)),
+            "use_ssl": bool(web_cfg.registration.get("use_ssl", False)),
+        }
+        SERVER_EMAIL = _email_user
+        DEFAULT_FROM_EMAIL = _email_user
+    MAILERS = {
+        "default": {
+            "BACKEND": "django.core.mail.backends.smtp.EmailBackend",
+            "OPTIONS": _mailer_options,
+        }
+    }
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    if web_cfg.registration.get("email_confirmation", False):
+        EMAIL_HOST = web_cfg.registration.get("email_host", False)
+        EMAIL_HOST_USER = web_cfg.registration.get("email_user", False)
+        EMAIL_HOST_PASSWORD = web_cfg.registration.get("email_password", False)
+        EMAIL_PORT = web_cfg.registration.get("email_port", 465)
+        EMAIL_TLS_SSL = web_cfg.registration.get("use_tls", False)
+        EMAIL_USE_SSL = web_cfg.registration.get("use_ssl", False)
+        SERVER_EMAIL = EMAIL_HOST_USER
+        DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 
 SITE_ID = 1
 
 # https://django-allauth.readthedocs.io/en/latest/configuration.html
 if web_cfg.registration.get("email_confirmation", False):
-    ACCOUNT_EMAIL_VERIFICATION = 'mandatory'
+    ACCOUNT_EMAIL_VERIFICATION = "mandatory"
     SOCIALACCOUNT_EMAIL_VERIFICATION = ACCOUNT_EMAIL_VERIFICATION
 else:
-    ACCOUNT_EMAIL_VERIFICATION = 'none'
+    ACCOUNT_EMAIL_VERIFICATION = "none"
     SOCIALACCOUNT_EMAIL_VERIFICATION = ACCOUNT_EMAIL_VERIFICATION
 
 ACCOUNT_EMAIL_REQUIRED = web_cfg.registration.get("email_required", False)
 ACCOUNT_EMAIL_SUBJECT_PREFIX = web_cfg.registration.get("email_prefix_subject", False)
-ACCOUNT_LOGIN_ATTEMPTS_LIMIT = 3
+ACCOUNT_RATE_LIMITS = {"login_failed": "3/m"}
 LOGIN_REDIRECT_URL = "/"
-ACCOUNT_LOGOUT_REDIRECT_URL = '/accounts/login/'
+ACCOUNT_LOGOUT_REDIRECT_URL = "/accounts/login/"
 MANUAL_APPROVE = web_cfg.registration.get("manual_approve", False)
 REGISTRATION_ENABLED = web_cfg.registration.get("enabled", False)
 EMAIL_CONFIRMATION = web_cfg.registration.get("email_confirmation", False)
-#### ALlauth end
+SOCIAL_AUTH_EMAIL_DOMAIN = web_cfg.web_auth.get("social_auth_email_domain", False)
+
+# Activate the social adapter so OIDC signups bypass the REGISTRATION_ENABLED
+# toggle (the public-signup form gate). Users coming through the IdP have
+# already been vetted and explicitly assigned to the app, so they shouldn't be
+# blocked by the same flag that closes anonymous signup. The adapter also
+# enforces the email-domain allowlist and IdP-group role mapping.
+SOCIALACCOUNT_ADAPTER = "web.allauth_adapters.MySocialAccountAdapter"
+SOCIALACCOUNT_AUTO_SIGNUP = True
+# Send the user straight to the IdP when they click the SSO button, skipping
+# allauth's intermediate confirmation page. (Login is initiated via GET.)
+SOCIALACCOUNT_LOGIN_ON_GET = True
+# SOCIALACCOUNT_ONLY = True
+# ACCOUNT_SIGNUP_FORM_CLASS = None
+# ACCOUNT_DEFAULT_HTTP_PROTOCOL = "https"
+
+#### AllAuth end
 
 if web_cfg.registration.get("disposable_email_disable", False):
     DISPOSABLE_DOMAIN_LIST = os.path.join(CUCKOO_PATH, web_cfg.registration.disposable_domain_list)
-    ACCOUNT_ADAPTER = 'web.allauth_adapters.DisposableEmails'
+    ACCOUNT_ADAPTER = "web.allauth_adapters.DisposableEmails"
 
 if web_cfg.registration.get("captcha_enabled", False):
-    ACCOUNT_SIGNUP_FORM_CLASS = 'web.allauth_forms.CaptchedSignUpForm'
+    ACCOUNT_SIGNUP_FORM_CLASS = "web.allauth_forms.CaptchedSignUpForm"
+# SOCIALACCOUNT_FORMS = {"signup": "web.allauth_forms.MyCustomSocialSignupForm"}
 
 # Fix to avoid migration warning in django 1.7 about test runner (1_6.W001).
 # In future it could be removed: https://code.djangoproject.com/ticket/23469
@@ -443,25 +473,48 @@ TEST_RUNNER = "django.test.runner.DiscoverRunner"
 # the site admins on every HTTP 500 error when DEBUG=False.
 # See http://docs.djangoproject.com/en/dev/topics/logging for
 # more details on how to customize your logging configuration.
+# if not RUNNING_TESTS:
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "filters": {"require_debug_false": {"()": "django.utils.log.RequireDebugFalse"}},
-    "handlers": {"mail_admins": {"level": "ERROR", "filters": ["require_debug_false"], "class": "django.utils.log.AdminEmailHandler"}},
-    "loggers": {"django.request": {"handlers": ["mail_admins"], "level": "ERROR", "propagate": True,},},
+    "handlers": {
+        "mail_admins": {"level": "ERROR", "filters": ["require_debug_false"], "class": "django.utils.log.AdminEmailHandler"}
+    },
+    "loggers": {
+        "django.request": {
+            "handlers": ["mail_admins"],
+            "level": "ERROR",
+            "propagate": True,
+        },
+    },
 }
 
 SILENCED_SYSTEM_CHECKS = [
     "admin.E408",
+    "models.W042",
     #'captcha.recaptcha_test_key_error'
 ]
 
 ALLOWED_HOSTS = ["*"]
 
+# Reverse-proxy TLS termination: when nginx terminates HTTPS and forwards plain
+# HTTP to gunicorn/daphne, Django must be told via X-Forwarded-Proto that the
+# original request was HTTPS — otherwise request.is_secure() is False and the
+# absolute OIDC redirect_uri django-allauth builds comes out as http://…, which
+# the IdP rejects. Requires `proxy_set_header X-Forwarded-Proto $scheme;` in nginx.
+#
+# Gated behind [general] behind_proxy because trusting X-Forwarded-Proto/Host is
+# only safe when a reverse proxy strips/overwrites those headers from clients —
+# enabling them with a directly-reachable app would allow proto/host spoofing.
+if web_cfg.general.get("behind_proxy", False):
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    USE_X_FORWARDED_HOST = True
+
 # Max size
 MAX_UPLOAD_SIZE = web_cfg.general.max_sample_size
-
-SECURE_REFERRER_POLICY = "same-origin" # "no-referrer-when-downgrade"
+# Google's OAuth might need: "strict-origin-when-cross-origin"
+SECURE_REFERRER_POLICY = "same-origin"  # "no-referrer-when-downgrade"
 
 # https://django-csp.readthedocs.io/en/latest/configuration.html
 CSP_DEFAULT_SRC = ["'self'"]
@@ -476,11 +529,35 @@ CSP_FONT_SRC = ["https://fonts.googleapis.com"]
 CSP_STYLE_SRC = ["'self'"]
 CSP_IMG_SRC = ["'self'"]
 
+RATELIMIT_ERROR_MSG = "Too many request without auth! You have exceed your free request per minute for anon users. We are researcher friendly and provide api, but if you buy a good whiskey to @doomedraven, we will be even more friendlier ;). Limits can be changed in conf/api.conf"
+
 # Hack to import local settings.
 try:
     LOCAL_SETTINGS
 except NameError:
-    try:
-        from .local_settings import *
-    except ImportError:
-        pass
+    with suppress(ImportError):
+        from .local_settings import *  # noqa: F403
+
+from lib.cuckoo.common.hooks import bootstrap_tenancy  # noqa: E402
+
+bootstrap_tenancy(Config("cuckoo"), settings_globals=globals())
+
+from lib.cuckoo.core.database import init_database
+
+init_database()
+
+# Prevent Django's and Werkzeug's auto-reloader from scanning/watching files inside workers/ folder
+RUNSERVER_PLUS_EXCLUDE_PATTERNS = [*globals().get("RUNSERVER_PLUS_EXCLUDE_PATTERNS", []), "*/workers/*"]
+
+with suppress(ImportError):
+    from werkzeug import _reloader
+
+    _reloader._ignore_common_dirs.add("workers")
+
+from django.dispatch import receiver
+from django.utils.autoreload import file_changed
+
+@receiver(file_changed)
+def ignore_workers_changes(sender, file_path, **kwargs):
+    if "/workers/" in str(file_path).replace("\\", "/"):
+        return True

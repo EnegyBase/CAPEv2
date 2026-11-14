@@ -14,13 +14,9 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 
-try:
-    import simplejson as json
-except ImportError:
-    import json
+import json
 import readline
 import select
-import sys
 from socket import AF_UNIX, error, socket
 
 from .suri_specs import argsd
@@ -28,6 +24,12 @@ from .suri_specs import argsd
 SURICATASC_VERSION = "1.0"
 VERSION = "0.2"
 INC_SIZE = 1024
+# Bound the wait for a suricata command reply. suricata acks socket commands in
+# milliseconds when healthy; the historical 600s ceiling meant that if the daemon
+# crashed mid-analysis the CAPE processing module blocked far past the 900s pebble
+# task budget -> the whole analysis was killed (failed_processing, no report).
+# 30s fails fast so the caller can break out and degrade gracefully.
+COMMAND_TIMEOUT = 30
 
 
 class SuricataException(Exception):
@@ -118,10 +120,17 @@ class SuricataSC:
         cmdret = None
         data = ""
         while True:
-            if sys.version < "3":
-                data += self.socket.recv(INC_SIZE)
-            else:
-                data += self.socket.recv(INC_SIZE).decode("iso-8859-1")
+            chunk = self.socket.recv(INC_SIZE).decode("iso-8859-1")
+            if not chunk:
+                # EOF: the peer closed the socket (e.g. the suricata daemon
+                # crashed/restarted mid-analysis). select() reports a closed
+                # socket as readable, so without this guard the loop spins on
+                # empty recv() forever, hanging the whole processing task until
+                # the 900s pebble timeout kills it (failed_processing, no
+                # report). Bail so send_command() raises and the caller can
+                # break out and degrade gracefully (report still generated).
+                break
+            data += chunk
             if data.endswith("\n"):
                 cmdret = json.loads(data)
                 break
@@ -129,64 +138,49 @@ class SuricataSC:
 
     def send_command(self, command, arguments=None):
         if command not in self.cmd_list and command != "command-list":
-            raise SuricataCommandException("Command not found: {}".format(command))
+            raise SuricataCommandException(f"Command not found: {command}")
 
-        cmdmsg = {}
-        cmdmsg["command"] = command
+        cmdmsg = {"command": command}
         if arguments:
             cmdmsg["arguments"] = arguments
         if self.verbose:
-            print("SND: " + json.dumps(cmdmsg))
-        cmdmsg_str = json.dumps(cmdmsg) + "\n"
-        if sys.version < "3":
-            self.socket.send(cmdmsg_str)
-        else:
-            self.socket.send(bytes(cmdmsg_str, "iso-8859-1"))
+            print(f"SND: {json.dumps(cmdmsg)}")
+        cmdmsg_str = f"{json.dumps(cmdmsg)}\n"
+        self.socket.send(bytes(cmdmsg_str, "iso-8859-1"))
 
-        ready = select.select([self.socket], [], [], 600)
-        if ready[0]:
-            cmdret = self.json_recv()
-        else:
-            cmdret = None
+        ready = select.select([self.socket], [], [], COMMAND_TIMEOUT)
+        cmdret = self.json_recv() if ready[0] else None
         if not cmdret:
             raise SuricataReturnException("Unable to get message from server")
 
         if self.verbose:
-            print("RCV: " + json.dumps(cmdret))
+            print(f"RCV: {json.dumps(cmdret)}")
 
         return cmdret
 
     def connect(self):
         try:
-            if self.socket == None:
+            if self.socket is None:
                 self.socket = socket(AF_UNIX)
             self.socket.connect(self.sck_path)
         except error as err:
-            raise SuricataNetException(err)
-
+            raise SuricataNetException(err) from err
         self.socket.settimeout(10)
         # send version
         if self.verbose:
-            print("SND: " + json.dumps({"version": VERSION}))
-        if sys.version < "3":
-            self.socket.send(json.dumps({"version": VERSION}))
-        else:
-            self.socket.send(bytes(json.dumps({"version": VERSION}), "iso-8859-1"))
+            print(f"SND: {json.dumps({'version': VERSION})}")
+        self.socket.send(bytes(json.dumps({"version": VERSION}), "iso-8859-1"))
 
-        ready = select.select([self.socket], [], [], 600)
-        if ready[0]:
-            cmdret = self.json_recv()
-        else:
-            cmdret = None
-
+        ready = select.select([self.socket], [], [], COMMAND_TIMEOUT)
+        cmdret = self.json_recv() if ready[0] else None
         if not cmdret:
             raise SuricataReturnException("Unable to get message from server")
 
         if self.verbose:
-            print("RCV: " + json.dumps(cmdret))
+            print(f"RCV: {json.dumps(cmdret)}")
 
         if cmdret["return"] == "NOK":
-            raise SuricataReturnException("Error: %s" % (cmdret["message"]))
+            raise SuricataReturnException(f"Error: {cmdret['message']}")
 
         cmdret = self.send_command("command-list")
 
@@ -203,8 +197,8 @@ class SuricataSC:
         full_cmd = command.split()
         cmd = full_cmd[0]
         cmd_specs = argsd[cmd]
-        required_args_count = len([d["required"] for d in cmd_specs if d["required"] and not "val" in d])
-        arguments = dict()
+        required_args_count = len([d["required"] for d in cmd_specs if d["required"] and "val" not in d])
+        arguments = {}
         for c, spec in enumerate(cmd_specs, 1):
             spec_type = str if "type" not in spec else spec["type"]
             if spec["required"]:
@@ -213,28 +207,27 @@ class SuricataSC:
                     continue
                 try:
                     arguments[spec["name"]] = spec_type(full_cmd[c])
-                except IndexError:
+                except IndexError as e:
                     phrase = " at least" if required_args_count != len(cmd_specs) else ""
-                    msg = "Missing arguments: expected{} {}".format(phrase, required_args_count)
-                    raise SuricataCommandException(msg)
+                    msg = f"Missing arguments: expected {phrase} {required_args_count}"
+                    raise SuricataCommandException(msg) from e
                 except ValueError as ve:
-                    raise SuricataCommandException("Erroneous arguments: {}".format(ve))
+                    raise SuricataCommandException(f"Erroneous arguments: {ve}") from ve
             elif c < len(full_cmd):
                 arguments[spec["name"]] = spec_type(full_cmd[c])
         return cmd, arguments
 
     def parse_command(self, command):
         arguments = None
-        cmd = command.split()[0] if command else None
-        if cmd in self.cmd_list:
-            if cmd in self.fn_commands:
-                cmd, arguments = getattr(self, "execute")(command=command)
-        else:
-            raise SuricataCommandException("Unknown command {}".format(command))
+        cmd = command.split(maxsplit=1)[0] if command else None
+        if cmd not in self.cmd_list:
+            raise SuricataCommandException(f"Unknown command {command}")
+        if cmd in self.fn_commands:
+            cmd, arguments = getattr(self, "execute")(command=command)
         return cmd, arguments
 
     def interactive(self):
-        print("Command list: " + ", ".join(self.cmd_list))
+        print(f"Command list: {', '.join(self.cmd_list)}")
         try:
             readline.set_completer(SuricataCompleter(self.cmd_list))
             readline.set_completer_delims(";")
@@ -250,22 +243,21 @@ class SuricataSC:
                     continue
                 try:
                     cmdret = self.send_command(cmd, arguments)
-                except IOError as err:
+                except IOError:
                     # try to reconnect and resend command
                     print("Connection lost, trying to reconnect")
                     try:
                         self.close()
                         self.connect()
-                    except SuricataNetException as err:
+                    except SuricataNetException:
                         print("Can't reconnect to suricata socket, discarding command")
                         continue
                     cmdret = self.send_command(cmd, arguments)
                 # decode json message
                 if cmdret["return"] == "NOK":
                     print("Error:")
-                    print(json.dumps(cmdret["message"], sort_keys=True, indent=4, separators=(",", ": ")))
                 else:
                     print("Success:")
-                    print(json.dumps(cmdret["message"], sort_keys=True, indent=4, separators=(",", ": ")))
+                print(json.dumps(cmdret["message"], sort_keys=True, indent=4, separators=(",", ": ")))
         except KeyboardInterrupt:
             print("[!] Interrupted")

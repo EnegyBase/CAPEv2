@@ -2,29 +2,33 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
+import datetime
 import logging
 import struct
-import datetime
+from contextlib import suppress
 
+from lib.cuckoo.common.logtbl import table as LOGTBL
+from lib.cuckoo.common.path_utils import path_get_filename
+from lib.cuckoo.common.utils import default_converter
+
+
+# bson from pymongo is C so is faster
 try:
     import bson
 
     HAVE_BSON = True
 except ImportError:
     HAVE_BSON = False
-else:
-    # The BSON module provided by pymongo works through its "BSON" class.
-    if hasattr(bson, "BSON"):
-        bson_decode = lambda d: bson.decode(d)
-    # The BSON module provided by "pip3 install bson" works through the "loads" function (just like pickle etc.)
-    elif hasattr(bson, "loads"):
-        bson_decode = lambda d: bson.loads(d)
-    else:
-        HAVE_BSON = False
 
-from lib.cuckoo.common.logtbl import table as LOGTBL
-from lib.cuckoo.common.utils import get_filename_from_path, default_converter
+capemon_pb2 = None
+HAVE_PROTOBUF = False
+
+with suppress(ImportError):
+    import google.protobuf  # noqa: F401
+    # Generated from data/capemon_pb.proto
+    # Try relative import first (if running as package)
+    import capemon_pb2
+    HAVE_PROTOBUF = True
 
 log = logging.getLogger(__name__)
 
@@ -34,23 +38,26 @@ log = logging.getLogger(__name__)
 # thus we can reuse report generation / signatures for other API trace sources.
 ###############################################################################
 
-TYPECONVERTERS = {"h": lambda v: "0x%08x" % default_converter(v), "p": lambda v: "0x%.08x" % default_converter(v)}
+TYPECONVERTERS = {
+    "h": lambda v: f"0x{default_converter(v) & 0xFFFFFFFF:08x}" if v < 0 else f"0x{default_converter(v):08x}",
+    "p": lambda v: f"0x{default_converter(v) & 0xFFFFFFFF:08x}" if v < 0 else f"0x{default_converter(v):08x}",
+}
 
 # 20 Mb max message length.
 MAX_MESSAGE_LENGTH = 20 * 1024 * 1024
 
 
 def pointer_converter_32bit(v):
-    return "0x%08x" % (v % 2 ** 32)
+    return f"0x{v % 2 ** 32:08x}"
 
 
 def pointer_converter_64bit(v):
-    return "0x%016x" % (v % 2 ** 64)
+    return f"0x{v % 2 ** 64:016x}"
 
 
 def default_converter_32bit(v):
     if isinstance(v, int) and v < 0:
-        return v % 2 ** 32
+        return v % 2**32
 
     # Try to avoid various unicode issues through usage of latin-1 encoding.
     if isinstance(v, str):
@@ -66,20 +73,18 @@ def default_converter_64bit(v):
     # return v % 2**64
 
     # Try to avoid various unicode issues through usage of latin-1 encoding.
-    if isinstance(v, str):
-        return v.decode("latin-1")
-    return v
+    return v.decode("latin-1") if isinstance(v, str) else v
 
 
 def check_names_for_typeinfo(arginfo):
-    argnames = [i[0] if type(i) in (list, tuple) else i for i in arginfo]
+    argnames = [i[0] if isinstance(i, (list, tuple)) else i for i in arginfo]
 
     converters = []
     for i in arginfo:
-        if type(i) in (list, tuple):
-            r = TYPECONVERTERS.get(i[1], None)
+        if isinstance(i, (list, tuple)):
+            r = TYPECONVERTERS.get(i[1])
             if not r:
-                log.debug("Analyzer sent unknown format " "specifier '{0}'".format(i[1]))
+                log.debug("Analyzer sent unknown format specifier '%s'", i[1])
                 r = default_converter
             converters.append(r)
         else:
@@ -88,7 +93,7 @@ def check_names_for_typeinfo(arginfo):
     return argnames, converters
 
 
-class BsonParser(object):
+class BsonParser:
     """Interprets .bson logs from the monitor.
     The monitor provides us with "info" messages that explain how the function
     arguments will come through later on. This class remembers these info
@@ -186,24 +191,24 @@ class BsonParser(object):
                 return
 
             if len(data) != 4:
-                log.critical("BsonParser lacking data.")
+                log.critical("BsonParser lacking data")
                 return
 
             blen = struct.unpack("I", data)[0]
             if blen > MAX_MESSAGE_LENGTH:
-                log.critical("BSON message larger than MAX_MESSAGE_LENGTH, " "stopping handler.")
+                log.critical("BSON message larger than MAX_MESSAGE_LENGTH, stopping handler")
                 return False
 
             data += self.fd.read(blen - 4)
 
             if len(data) < blen:
-                log.critical("BsonParser lacking data.")
+                log.critical("BsonParser lacking data")
                 return
 
             try:
-                dec = bson_decode(data)
+                dec = bson.decode(data)
             except Exception as e:
-                log.warning("BsonParser decoding problem {0} on " "data[:50] {1}".format(e, repr(data[:50])))
+                log.warning("BsonParser decoding problem %s on data[:50] %s", e, data[:50])
                 return False
 
             mtype = dec.get("type", "none")
@@ -229,7 +234,7 @@ class BsonParser(object):
                     category = [_ for _ in LOGTBL if _[0] == name]
 
                     # If we found an entry, take its category, otherwise we take
-                    # the default string "unknown."
+                    # the default string "unknown".
                     category = category[0][1] if category else "unknown"
 
                 argnames, converters = check_names_for_typeinfo(arginfo)  # self.determine_unserializers(arginfo)
@@ -247,7 +252,7 @@ class BsonParser(object):
                     continue
 
             elif mtype == "debug":
-                log.info("Debug message from monitor: " "{0}".format(dec.get("msg", "")))
+                log.info("Debug message from monitor: %s", dec.get("msg", ""))
 
             elif mtype == "new_process":
                 # new_process message from VMI monitor.
@@ -261,17 +266,17 @@ class BsonParser(object):
             else:
                 # Regular api call.
                 if index not in self.infomap:
-                    log.warning("Got API with unknown index - monitor needs " "to explain first: {0}".format(dec))
+                    log.warning("Got API with unknown index - monitor needs to explain first: %s", dec)
                     return True
 
                 apiname, arginfo, argnames, converters, category = self.infomap[index]
                 args = dec.get("args", [])
 
                 if len(args) != len(argnames):
-                    log.warning("Inconsistent arg count (compared to arg names) " "on %s: %s names %s", dec, argnames, apiname)
+                    log.warning("Inconsistent arg count (compared to arg names) on %s: %s names %s", dec, argnames, apiname)
                     continue
 
-                argdict = dict((argnames[i], converters[i](args[i])) for i in range(len(args)))
+                argdict = {name: conv(arg) for name, conv, arg in zip(argnames, converters, args)}
 
                 if apiname == "__process__":
                     # Special new process message from cuckoomon.
@@ -285,7 +290,7 @@ class BsonParser(object):
                     pid = argdict["ProcessIdentifier"]
                     ppid = argdict["ParentProcessIdentifier"]
                     modulepath = argdict["ModulePath"]
-                    procname = get_filename_from_path(modulepath)
+                    procname = path_get_filename(modulepath)
 
                     self.fd.log_process(context, vmtime, pid, ppid, modulepath, procname)
                     return True
@@ -313,3 +318,98 @@ class BsonParser(object):
                 self.fd.log_call(context, apiname, category, arguments)
 
             return True
+
+
+class ProtobufParser:
+    def __init__(self, fd, task_id=None):
+        self.fd = fd
+        self.task_id = task_id
+        self.infomap = {}
+        if not HAVE_PROTOBUF:
+            log.critical("Starting ProtobufParser, but protobuf is not available!")
+        if HAVE_PROTOBUF and not capemon_pb2:
+            log.warning("ProtobufParser: capemon_pb2 module not found. Protobuf parsing will fail.")
+
+    def read_next_message(self):
+        while True:
+            data = self.fd.read(4)
+            if not data:
+                return
+
+            if len(data) != 4:
+                log.critical("ProtobufParser lacking data (header)")
+                return
+
+            blen = struct.unpack("I", data)[0]
+            if blen > MAX_MESSAGE_LENGTH:
+                log.critical("Protobuf message larger than MAX_MESSAGE_LENGTH, stopping handler")
+                return False
+
+            data = self.fd.read(blen)
+            if len(data) < blen:
+                log.critical("ProtobufParser lacking data (payload)")
+                return
+
+            if not HAVE_PROTOBUF or not capemon_pb2:
+                # Cannot parse without the definition
+                continue
+
+            try:
+                msg = capemon_pb2.HookEvent()
+                msg.ParseFromString(data)
+                self.process_message(msg)
+            except Exception as e:
+                log.exception("Protobuf decoding error: %s", e)
+                return False
+
+            return True
+
+    def process_message(self, msg):
+        # Context: [index, repeated, is_success, retval, tid, time, caller, parent_caller]
+        context = [-1, 0, 1, 0, 0, 0, 0, 0]
+
+        msg_type = msg.WhichOneof("payload")
+
+        if msg_type == "info":
+            info = msg.info
+            name = info.name
+            category = info.category or "unknown"
+
+            arginfo = []
+            for arg in info.args:
+                arginfo.append((arg.name, arg.type))
+
+            argnames, converters = check_names_for_typeinfo(arginfo)
+            self.infomap[info.index] = name, arginfo, argnames, converters, category
+
+        elif msg_type == "debug":
+            log.info("Debug message from monitor: %s", msg.debug.message)
+
+        elif msg_type == "new_process":
+            proc = msg.new_process
+            vmtime = datetime.datetime.fromtimestamp(proc.timestamp)
+            self.fd.log_process(context, vmtime, proc.pid, proc.ppid, proc.module_path, proc.proc_name)
+
+        elif msg_type == "call":
+            call = msg.call
+            if call.index not in self.infomap:
+                log.warning("Got Protobuf API with unknown index: %s", call.index)
+                return
+
+            apiname, _, argnames, converters, category = self.infomap[call.index]
+
+            context[0] = call.index
+            context[2] = 1 if call.is_success else 0
+            context[3] = call.retval
+            context[4] = call.thread_id
+            context[5] = call.timestamp
+            context[6] = call.return_address
+            context[7] = call.parent_return_address
+
+            arguments = []
+            if len(call.arguments) == len(argnames):
+                arguments = [(name, conv(val)) for name, conv, val in zip(argnames, converters, call.arguments)]
+
+            self.fd.log_call(context, apiname, category, arguments)
+
+

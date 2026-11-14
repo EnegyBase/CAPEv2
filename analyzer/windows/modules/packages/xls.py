@@ -2,32 +2,34 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-
-from __future__ import absolute_import
-import os
 from lib.common.abstracts import Package
+from lib.common.common import check_file_extension
+from lib.common.constants import MSOFFICE_TRUSTED_PATH, TRUSTED_PATH_TEXT
 
 
 class XLS(Package):
     """Excel analysis package."""
 
-    def __init__(self, options={}, config=None):
+    default_curdir = MSOFFICE_TRUSTED_PATH
+
+    def __init__(self, options=None, config=None):
+        if options is None:
+            options = {}
         self.config = config
         self.options = options
-        self.options["exclude-apis"] = "memcpy"
-        self.options["office"] = "1"
 
     PATHS = [
         ("ProgramFiles", "Microsoft Office", "EXCEL.EXE"),
         ("ProgramFiles", "Microsoft Office", "Office*", "EXCEL.EXE"),
         ("ProgramFiles", "Microsoft Office*", "root", "Office*", "EXCEL.EXE"),
     ]
+    summary = "Opens the supplied document with EXCEL.EXE."
+    description = f"""Uses 'EXCEL.EXE <path> /dde' to open the file.
+    {TRUSTED_PATH_TEXT}
+    The .xls filename extension will be added automatically."""
 
     def start(self, path):
-        if "." not in os.path.basename(path):
-            new_path = path + ".xls"
-            os.rename(path, new_path)
-            path = new_path
-
-        excel = self.get_path_glob("Microsoft Office Excel")
-        return self.execute(excel, '"%s" /dde' % path, path)
+        if not path.endswith((".xls", ".xlsx", ".xlsb", ".xlsm", ".slk", ".ods")):
+            path = check_file_extension(path, ".xls")
+        excel = self.get_path_glob("EXCEL.EXE")
+        return self.execute(excel, f'"{path}" /dde', path)

@@ -1,9 +1,10 @@
 # Copyright (C) 2014-2016 Cuckoo Foundation.
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
-from __future__ import absolute_import
+
 import os
 import tempfile
+
 from lib.common.rand import random_string
 
 ROOT = os.path.join(tempfile.gettempdir(), random_string(6, 10))
@@ -16,3 +17,13 @@ PATHS = {
     "memory": os.path.join(ROOT, "memory"),
     "drop": os.path.join(ROOT, "drop"),
 }
+
+OPT_CURDIR = "curdir"
+OPT_MULTI_PASSWORD = "enable_multi_password"
+OPT_PASSWORD = "password"
+OPT_RECURSION_DEPTH = "recursion_depth"
+OPT_MAX_EXECUTABLES = "max_executables"
+OPT_FILE = "file"
+OPT_ARGUMENTS = "arguments"
+
+ARCHIVE_OPTIONS = (OPT_FILE, OPT_PASSWORD, OPT_RECURSION_DEPTH, OPT_MAX_EXECUTABLES)

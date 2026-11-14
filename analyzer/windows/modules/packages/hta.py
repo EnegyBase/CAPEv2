@@ -2,13 +2,8 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
-import logging
-
 from lib.common.abstracts import Package
-
-log = logging.getLogger(__name__)
+from lib.common.common import check_file_extension
 
 
 class HTA(Package):
@@ -17,12 +12,11 @@ class HTA(Package):
     PATHS = [
         ("SystemRoot", "system32", "mshta.exe"),
     ]
+    summary = "Executes the sample with mshta.exe."
+    description = """Uses 'mshta.exe <sample>' to run a .hta file.
+    The .hta filename extension will be added automatically."""
 
     def start(self, path):
         mshta = self.get_path("mshta.exe")
-
-        if not path.endswith(".hta"):
-            os.rename(path, path + ".hta")
-            path += ".hta"
-
-        return self.execute(mshta, '"%s"' % path, path)
+        path = check_file_extension(path, ".hta")
+        return self.execute(mshta, f'"{path}"', path)

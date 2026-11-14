@@ -2,19 +2,38 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
+import os
+
 from lib.common.abstracts import Package
+from lib.common.common import check_file_extension
+from lib.common.constants import OPT_ARGUMENTS
+from lib.common.exceptions import CuckooPackageError
 
 
 class Python(Package):
     """Python analysis package."""
 
-    PATHS = [
-        ("HomeDrive", "Python*", "python.exe"),
-        ("SYSTEMROOT", "py.exe")
-    ]
+    PATHS = [("HomeDrive", "Python*", "python.exe"), ("SystemRoot", "py.exe")]
+    summary = "Executes sample file with python."
+    description = f"""Uses python.exe or py.exe to run a python script.
+    If the '{OPT_ARGUMENTS}' option is set, the contents will be used as arguments to the python script."""
+    option_names = (OPT_ARGUMENTS,)
 
     def start(self, path):
-        python = self.get_path_glob("Python")
-        arguments = self.options.get("arguments", "")
-        return self.execute(python, "%s %s" % (path, arguments), path)
+        # Try getting python or py as a backup
+        try:
+            python = self.get_path_glob("python.exe")
+        except CuckooPackageError:
+            python = self.get_path_glob("py.exe")
+
+        # Set PYTHONHOME to help Python locate its standard library during initialization.
+        # Python may fail to load the 'encodings' module, resulting in:
+        #       "ModuleNotFoundError: No module named 'encodings'"
+        # Might break if your Python is in VENV
+        python_home = os.path.dirname(python)
+        os.environ["PYTHONHOME"] = python_home
+
+        arguments = self.options.get(OPT_ARGUMENTS, "")
+
+        path = check_file_extension(path, ".py")
+        return self.execute(python, f"{path} {arguments}", path)

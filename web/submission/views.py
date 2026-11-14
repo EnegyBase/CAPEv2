@@ -3,44 +3,50 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-from __future__ import print_function
-import os
-import sys
+import ast
 import logging
-import tempfile
+import os
 import random
-
-try:
-    import re2 as re
-except ImportError:
-    import re
+import sys
+import textwrap
+from base64 import urlsafe_b64encode
+from contextlib import suppress
 
 from django.conf import settings
-from django.shortcuts import redirect, render
 from django.contrib.auth.decorators import login_required
+from django.shortcuts import redirect, render
 
 sys.path.append(settings.CUCKOO_PATH)
-from lib.cuckoo.common.objects import File
-from lib.cuckoo.common.config import Config
-from lib.cuckoo.common.quarantine import unquarantine
-from lib.cuckoo.common.saztopcap import saz_to_pcap
-from lib.cuckoo.core.database import Database
-from lib.cuckoo.core.rooter import vpns, _load_socks5_operational
-from lib.cuckoo.common.utils import store_temp_file, sanitize_filename, get_user_filename, generate_fake_name, get_options
-from lib.cuckoo.common.web_utils import download_file, get_file_content, _download_file, parse_request_arguments, all_vms_tags, download_from_vt, perform_search
+from uuid import NAMESPACE_DNS, uuid3
 
+from lib.cuckoo.common.config import Config
+from lib.cuckoo.common.path_utils import path_delete, path_exists
+from lib.cuckoo.common.saztopcap import saz_to_pcap
+from lib.cuckoo.common.utils import get_options, get_user_filename, sanitize_filename, store_temp_file
+from lib.cuckoo.common.web_utils import (
+    download_file,
+    download_from_3rdparty,
+    downloader_services,
+    get_file_content,
+    load_vms_exits,
+    load_vms_tags,
+    parse_request_arguments,
+    perform_search,
+    process_new_dlnexec_task,
+    process_new_task_files,
+    stop_analysis_task,
+)
+from lib.cuckoo.core.database import Database
+from lib.cuckoo.core.rooter import _load_socks5_operational, vpns
 
 # this required for hash searches
-FULL_DB = False
 cfg = Config("cuckoo")
 routing = Config("routing")
 repconf = Config("reporting")
+distconf = Config("distributed")
 processing = Config("processing")
 aux_conf = Config("auxiliary")
 web_conf = Config("web")
-
-VALID_LINUX_TYPES = ["Bourne-Again", "POSIX shell script", "ELF", "Python"]
 
 db = Database()
 
@@ -50,40 +56,179 @@ disable_warnings()
 
 logger = logging.getLogger(__name__)
 
+allowed_functions = {
+    "sorted": sorted,
+    "set": set,
+    "os.path.join": os.path.join,
+}
 
-if repconf.mongodb.enabled:
-    import pymongo
 
-    results_db = pymongo.MongoClient(
-        repconf.mongodb.host,
-        port=repconf.mongodb.port,
-        username=repconf.mongodb.get("username", None),
-        password=repconf.mongodb.get("password", None),
-        authSource=repconf.mongodb.db,
-    )[repconf.mongodb.db]
-    FULL_DB = True
+def parse_expr(expr, context):
+    """Return the value from a python AST expression.
 
-def get_form_data(platform):
-    files = os.listdir(os.path.join(settings.CUCKOO_PATH, "analyzer", platform, "modules", "packages"))
+    Recursive! the initial call is the right hand side of an assignment.
+    Recursion is necessary because the expression is made up of a variable number
+    of subexpressions, sub-subexpressions, etc.
+    """
+    if isinstance(expr, str):
+        return expr
+    if isinstance(expr, ast.Constant):
+        return expr.value
+    if isinstance(expr, ast.Name):
+        # To get the value associated with the variable name, look up name (expr.id) in context.
+        # If lookup fails (we do not know the value of the variable), return the name.
+        return context.get(expr.id, str(expr.id))
+    if isinstance(expr, ast.List):
+        return [parse_expr(item, context) for item in expr.elts]
+    if isinstance(expr, ast.Tuple):
+        return tuple([parse_expr(item, context) for item in expr.elts])
+    if isinstance(expr, ast.JoinedStr):
+        # JoinedStr - coerce each item to string, and join them.
+        return "".join([str(parse_expr(item, context)) for item in expr.values])
+    if isinstance(expr, ast.FormattedValue):
+        return parse_expr(expr.value, context)
+    if isinstance(expr, ast.Attribute):
+        # Join expr.value to expr.attr with a "." between. Example: os.path.join
+        return parse_expr(expr.value, context) + "." + parse_expr(expr.attr, context)
+    if isinstance(expr, ast.Call):
+        # Figure out what function is being called, with what arguments.
+        func = parse_expr(expr.func, context)
+        args = tuple([parse_expr(item, context) for item in expr.args])
 
-    packages = []
-    for name in files:
-        name = os.path.splitext(name)[0]
-        if name == "__init__":
-            continue
-        packages.append(name)
+        if func in allowed_functions:
+            # Actually call the function, passing the args, and return the result.
+            return allowed_functions[func](*args)
+        # Don't execute the call, but instead, give back a string representation.
+        return f"<{func}{args}>"
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        left = parse_expr(expr.left, context)
+        right = parse_expr(expr.right, context)
+        try:
+            ans = left + right
+        except TypeError:
+            # Expected behavior during unit tests
+            ans = str(left) + str(right)
+        return ans
+    # Not expected to reach this, but should aid in debugging if found.
+    return f"?? Unexpected type({type(expr)}) in parse_expr()"
+
+
+def parse_ast(items, context=None):
+    """Look at each item in a list of ast elements.
+
+    Item type ast.Assign signifies a statement of the form 'name = value'.
+    Work out the value using parse_expr.
+    Add an entry of the form 'name' = value to the context dictionary.
+    """
+    if not context:
+        context = dict()
+    for item in items:
+        if isinstance(item, ast.Assign):
+            key = item.targets[0].id
+            context[key] = parse_expr(item.value, context)
+    return context
+
+
+def get_lib_common_constants(platform):
+    """Extract constants from lib.common.constants into a dict"""
+    constant_file = os.path.join(settings.CUCKOO_PATH, "analyzer", platform, "lib", "common", "constants.py")
+    with open(constant_file, "r") as f:
+        contents = f.read()
+    tr = ast.parse(contents)
+    the_dict = parse_ast(tr.body)
+    return the_dict
+
+
+def get_package_info(dir_name, filename, platform, common_context):
+    """Find out everything we can about the package."""
+    default_summary = f"Package {filename} has no summary"
+    default_description = f"Package {filename} has no description"
+    # Clear out previous package description etc.
+    to_delete = ("summary", "description", "option_names")
+    for item in to_delete:
+        if item in common_context:
+            del common_context[item]
+    with open(os.path.join(dir_name, filename), "r") as f:
+        contents = f.read()
+    tr = ast.parse(contents)
+    expanded_context = parse_ast(tr.body, common_context)
+    classes = [item for item in tr.body if isinstance(item, ast.ClassDef) and item.bases and item.bases[0].id == "Package"]
+    if classes:
+        classname = classes[0].name
+        assignments = parse_ast(classes[0].body, expanded_context)
+    else:
+        # No class inherited from 'Package'
+        classname = "unknown classname"
+        assignments = dict()
+    summary = assignments.get("summary", default_summary)
+    description = textwrap.dedent(assignments.get("description", default_description))
+    option_names = assignments.get("option_names", ())
+    if option_names:
+        description = description + f"\nOPTIONS: {option_names}"
+    result = {
+        "name": os.path.splitext(filename)[0],
+        "value": os.path.splitext(filename)[0],
+        "classname": classname,
+        "platform": platform,
+        "summary": summary,
+        "description": description,
+        "option_names": option_names,
+    }
+    return result
+
+
+def get_enabled_platforms():
+    """Return a list of enabled platforms.
+
+    We are going to assume that the windows platform is first in the list."""
+    platforms = ["windows"]
+    if web_conf.linux.enabled:
+        platforms.append("linux")
+    return platforms
+
+
+def correlate_platform_packages(platform_package_dict):
+    """Given a per-platform dictionary, return a single list of all packages"""
+    package_names = set()
+    result = []
+    for platform in get_enabled_platforms():
+        for package in platform_package_dict.get(platform, []):
+            package_name = package["name"].lower()
+            if package_name not in package_names:
+                package_names.add(package_name)
+                if platform != "windows":
+                    # The windows analyzer package list did not contain this package name.
+                    package["name"] = package["name"] + f" ({platform} only)"
+                result.append(package)
+    return result
+
+
+def get_form_data():
+    """Return data about packages and machines to help build the submission form."""
+    platforms = get_enabled_platforms()
+
+    platform_packages = dict()
+    for platform in platforms:
+        common_context = get_lib_common_constants(platform)
+        package_root = os.path.join(settings.CUCKOO_PATH, "analyzer", platform, "modules", "packages")
+        files = [item.name for item in os.scandir(package_root) if item.is_file() and not item.name.startswith(".")]
+        exclusions = [package.strip() + ".py" for package in web_conf.package_exclusion.packages.split(",")]
+
+        exclusions.append("__init__.py")
+
+        platform_packages[platform] = [
+            get_package_info(package_root, name, platform, common_context) for name in files if name not in exclusions
+        ]
+    packages = correlate_platform_packages(platform_packages)
 
     # Prepare a list of VM names, description label based on tags.
     machines = []
     for machine in db.list_machines():
-        tags = []
-        for tag in machine.tags:
-            tags.append(tag.name)
+        tags = [tag.name for tag in machine.tags]
 
+        label = f"{machine.label}:{machine.arch}"
         if tags:
-            label = "{}:{}".format(machine.label, ",".join(tags))
-        else:
-            label = "{}".format(machine.label)
+            label = f"{label}:{','.join(tags)}"
 
         if web_conf.linux.enabled:
             label = machine.platform + ":" + label
@@ -98,8 +243,79 @@ def get_form_data(platform):
     return packages, machines
 
 
+_BATCH_TERMINAL_STATUSES = {
+    "reported",
+    "failed_analysis",
+    "failed_processing",
+    "failed_reporting",
+    "recovered",
+    "distributed_completed",
+}
+
+
+def _build_batch_tasks_info(request, task_ids):
+    """Build live status table rows and polling metadata for a batch of task IDs."""
+    rows = []
+    if not task_ids:
+        return rows, True
+
+    all_terminal = True
+    for raw_id in task_ids:
+        try:
+            tid = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+
+        task = None
+        with suppress(Exception):
+            from sqlalchemy import select
+
+            from lib.cuckoo.common.hooks import apply_sql_task_filter
+            from lib.cuckoo.core.data.task import Task
+
+            base_stmt = select(Task).where(Task.id == tid)
+            filtered_stmt = apply_sql_task_filter(base_stmt)
+            if filtered_stmt is not base_stmt:
+                with db.session.begin():
+                    task_row = db.session.scalars(filtered_stmt).first()
+                if task_row:
+                    task = task_row.to_dict()
+            else:
+                task_obj = db.view_task(tid, details=True)
+                if task_obj:
+                    task = task_obj.to_dict() if hasattr(task_obj, "to_dict") else task_obj
+
+        if not task:
+            continue
+
+        raw_status = str(task.get("status", "pending"))
+        status = "processing" if raw_status == "completed" else raw_status
+        target = task.get("target") or ""
+        sample = task.get("sample") or {}
+        sha256 = sample.get("sha256", "") if isinstance(sample, dict) else getattr(sample, "sha256", "")
+        is_reported = raw_status in {"reported", "distributed_completed"}
+        is_terminal = raw_status in _BATCH_TERMINAL_STATUSES
+        if not is_terminal:
+            all_terminal = False
+
+        rows.append(
+            {
+                "id": tid,
+                "target": os.path.basename(target) if target and task.get("category") == "file" else target,
+                "full_target": target,
+                "category": task.get("category", "file"),
+                "status": status,
+                "sha256": sha256,
+                "is_reported": is_reported,
+                "is_terminal": is_terminal,
+            }
+        )
+
+    return rows, all_terminal
+
+
 # Conditional decorator for web authentication
-class conditional_login_required(object):
+class conditional_login_required:
     def __init__(self, dec, condition):
         self.decorator = dec
         self.condition = condition
@@ -110,32 +326,118 @@ class conditional_login_required(object):
         return self.decorator(func)
 
 
-def force_int(value):
-    try:
-        value = int(value)
-    except:
-        value = 0
-    finally:
-        return value
+def _resolve_submission_target(request):
+    """Resolve (task_category, samples) from POST/FILES, honoring active_tab when provided
+    so stale inputs in inactive tabs do not override the user's selected tab."""
+    active_tab = (request.POST.get("active_tab") or "").strip().lstrip("#").lower()
+
+    def _get_resubmit():
+        val = (request.POST.get("hash") or "").strip()
+        return ("resubmit", val.split(",")) if val else (False, [])
+
+    def _get_sample():
+        return ("sample", request.FILES.getlist("sample")) if "sample" in request.FILES else (False, [])
+
+    def _get_static():
+        return ("static", request.FILES.getlist("static")) if "static" in request.FILES else (False, [])
+
+    def _get_pcap():
+        return ("pcap", request.FILES.getlist("pcap")) if "pcap" in request.FILES else (False, [])
+
+    def _get_url():
+        val = (request.POST.get("url") or "").strip()
+        return ("url", val) if val else (False, [])
+
+    def _get_dlnexec():
+        val = (request.POST.get("dlnexec") or "").strip()
+        return ("dlnexec", val) if val else (False, [])
+
+    def _get_downloading_service():
+        val = (request.POST.get("hashes") or "").strip()
+        return ("downloading_service", val) if val else (False, [])
+
+    tab_resolvers = {
+        "resubmit": _get_resubmit,
+        "file": _get_sample,
+        "sample": _get_sample,
+        "static": _get_static,
+        "pcap": _get_pcap,
+        "url": _get_url,
+        "dlurl": _get_dlnexec,
+        "dlnexec": _get_dlnexec,
+        "downloading_service": _get_downloading_service,
+        "hashes": _get_downloading_service,
+    }
+
+    if active_tab in tab_resolvers:
+        return tab_resolvers[active_tab]()
+
+    for resolver in (
+        _get_resubmit,
+        _get_sample,
+        _get_static,
+        _get_pcap,
+        _get_url,
+        _get_dlnexec,
+        _get_downloading_service,
+    ):
+        task_category, samples = resolver()
+        if task_category:
+            return task_category, samples
+    return False, []
 
 
-def get_platform(magic):
-    if magic and any(x in magic for x in VALID_LINUX_TYPES):
-        return "linux"
-    else:
-        return "windows"
+def _lookup_precheck_existent_tasks(request, raw_hashes: str) -> dict:
+    existent_tasks = {}
+    if not raw_hashes or not web_conf.general.get("existent_tasks", False):
+        return existent_tasks
+    candidates = [h.strip().lower() for h in raw_hashes.split(",") if h.strip()]
+    seen = set()
+    for sha256 in candidates[:10]:
+        if sha256 in seen or len(sha256) != 64 or not all(c in "0123456789abcdef" for c in sha256):
+            continue
+        seen.add(sha256)
+        with suppress(Exception):
+            records = perform_search("target_sha256", sha256, search_limit=5)
+            for record in records or []:
+                rec_sha = record.get("target", {}).get("file", {}).get("sha256") or sha256
+                existent_tasks.setdefault(rec_sha, []).append(record)
+    return existent_tasks
 
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
-def index(request, resubmit_hash=False):
-    if request.method == "POST":
+def index(request, task_id=None, resubmit_hash=None):
+    if request.method != "POST" and "precheck_sha256" in request.GET:
+        existent_tasks = _lookup_precheck_existent_tasks(request, request.GET.get("precheck_sha256", ""))
+        return render(request, "submission/_existent_tasks.html", {"existent_tasks": existent_tasks})
 
-        static, package, timeout, priority, options, machine, platform, tags, custom, memory, \
-            clock, enforce_timeout, shrike_url, shrike_msg, shrike_sid, shrike_refer, unique, referrer, \
-            tlp, tags_tasks, route, cape = parse_request_arguments(request)
+    remote_console = False
+    if request.method == "POST":
+        (
+            static,
+            package,
+            timeout,
+            priority,
+            options,
+            machine,
+            platform,
+            tags,
+            custom,
+            memory,
+            clock,
+            enforce_timeout,
+            unique,
+            referrer,
+            tlp,
+            tags_tasks,
+            route,
+            cape,
+        ) = parse_request_arguments(request)
 
         # This is done to remove spaces in options but not breaks custom paths
-        options = ",".join("=".join(value.strip() for value in option.split("=", 1)) for option in options.split(",") if option and "=" in option)
+        options = ",".join(
+            "=".join(value.strip() for value in option.split("=", 1)) for option in options.split(",") if option and "=" in option
+        )
         opt_filename = get_user_filename(options, custom)
 
         if priority and web_conf.public.enabled and web_conf.public.priority and not request.user.is_staff:
@@ -156,6 +458,17 @@ def index(request, resubmit_hash=False):
         if request.POST.get("nohuman"):
             options += "nohuman=yes,"
 
+        if request.POST.get("mitmdump"):
+            options += "mitmdump=yes,"
+
+        if web_conf.guacamole.enabled and request.POST.get("interactive"):
+            remote_console = True
+            options += "interactive=1,"
+            if "nohuman=yes," not in options:
+                options += "nohuman=yes,"
+            if request.POST.get("manual"):
+                options += "manual=1,"
+
         if request.POST.get("tor"):
             options += "tor=yes,"
 
@@ -165,11 +478,17 @@ def index(request, resubmit_hash=False):
         if request.POST.get("process_memory"):
             options += "procmemdump=1,"
 
+        if request.POST.get("amsidump"):
+            options += "amsidump=1,"
+
         if request.POST.get("import_reconstruction"):
             options += "import_reconstruction=1,"
 
-        if request.POST.get("disable_cape"):
-            options += "disable_cape=1,"
+        if request.POST.get("unpacker"):
+            options += "unpacker=2,"
+
+        if not request.POST.get("syscall"):
+            options += "syscall=0,"
 
         if request.POST.get("kernel_analysis"):
             options += "kernel_analysis=yes,"
@@ -178,10 +497,17 @@ def index(request, resubmit_hash=False):
             options += "norefer=1,"
 
         if request.POST.get("oldloader"):
-            options += "loader=oldloader.exe,loader_64=oldloader_x64.exe,"
+            options += "no-iat=1,"
 
         if request.POST.get("unpack"):
             options += "unpack=yes,"
+
+        if request.POST.get("screenshots_qr"):
+            options += "screenshots_qr=yes,"
+
+        job_category = False
+        if request.POST.get("job_category"):
+            job_category = request.POST.get("job_category")
 
         options = options[:-1]
 
@@ -191,8 +517,7 @@ def index(request, resubmit_hash=False):
             opt_apikey = opts.get("apikey", False)
 
         status = "ok"
-        task_ids_tmp = list()
-        existent_tasks = dict()
+        existent_tasks = {}
         details = {
             "errors": [],
             "content": False,
@@ -207,258 +532,283 @@ def index(request, resubmit_hash=False):
             "options": options,
             "only_extraction": False,
             "user_id": request.user.id or 0,
+            "package": package,
         }
+        if opt_apikey:
+            details["apikey"] = opt_apikey
 
-        if "hash" in request.POST and request.POST.get("hash", False) and request.POST.get("hash")[0] != '':
-            resubmission_hash = request.POST.get("hash").strip()
-            paths = db.sample_path_by_hash(resubmission_hash)
-            if paths:
+        if web_conf.pre_script.enabled and "pre_script" in request.FILES:
+            pre_script = request.FILES["pre_script"]
+            details["pre_script_name"] = pre_script.name
+            details["pre_script_content"] = pre_script.read()
+            pre_script.close()
+
+        if web_conf.during_script.enabled and "during_script" in request.FILES:
+            during_script = request.FILES["during_script"]
+            details["during_script_name"] = during_script.name
+            details["during_script_content"] = during_script.read()
+            during_script.close()
+
+        task_category, samples = _resolve_submission_target(request)
+        list_of_tasks = []
+        if task_category in ("url", "dlnexec"):
+            if not samples:
+                return render(request, "error.html", {"error": "You specified an invalid URL!"})
+            urls = [u.strip() for u in samples.split(web_conf.general.url_splitter) if u.strip()] if web_conf.general.url_splitter else [samples]
+            for url in urls:
+                url = url.replace("hxxps://", "https://").replace("hxxp://", "http://").replace("[.]", ".")
+                if task_category == "dlnexec":
+                    path, content, sha256 = process_new_dlnexec_task(url, route, options, custom)
+                    if path:
+                        list_of_tasks.append((content, path, sha256))
+                elif task_category == "url":
+                    list_of_tasks.append(("", url, ""))
+
+        elif task_category in ("sample", "static", "pcap"):
+            list_of_tasks, details = process_new_task_files(request, samples, details, opt_filename, unique)
+
+        elif task_category == "resubmit":
+            for hash in samples:
+                paths = []
+                if len(hash) in (32, 40, 64):
+                    paths = db.sample_path_by_hash(hash)
+                else:
+                    task_binary = os.path.join(settings.CUCKOO_PATH, "storage", "analyses", str(task_id), "binary")
+                    if path_exists(task_binary):
+                        paths.append(task_binary)
+                    else:
+                        tmp_paths = db.find_sample(task_id=task_id)
+                        if not tmp_paths:
+                            details["errors"].append({hash: "Task not found for resubmission"})
+                            continue
+                        for tmp_sample in tmp_paths:
+                            path = False
+                            tmp_dict = tmp_sample.to_dict()
+                            if path_exists(tmp_dict.get("target", "")):
+                                path = tmp_dict["target"]
+                            else:
+                                tmp_tasks = db.find_sample(sample_id=tmp_dict["sample_id"])
+                                for tmp_task in tmp_tasks:
+                                    tmp_path = os.path.join(
+                                        settings.CUCKOO_PATH, "storage", "binaries", tmp_task.to_dict()["sha256"]
+                                    )
+                                    if path_exists(tmp_path):
+                                        path = tmp_path
+                                        break
+                            if path:
+                                paths.append(path)
+
+                if not paths:
+                    for folder_name in ("selfextracted", "files", "procdump", "CAPE"):
+                        # Self Extracted support folder
+                        path = os.path.join(settings.CUCKOO_PATH, "storage", "analyses", str(task_id), folder_name, hash)
+                        if path_exists(path):
+                            paths.append(path)
+
+                if not paths:
+                    details["errors"].append({hash: "File not found on hdd for resubmission"})
+                    continue
+
                 content = get_file_content(paths)
                 if not content:
-                    return render(request, "error.html", {"error": "Can't find {} on disk, {}".format(resubmission_hash, str(paths))})
-                folder = os.path.join(settings.TEMP_PATH, "cape-resubmit")
-                if not os.path.exists(folder):
-                    os.makedirs(folder)
-                base_dir = tempfile.mkdtemp(prefix='resubmit_', dir=folder)
-                if opt_filename:
-                    filename = base_dir + "/" + opt_filename
-                else:
-                    filename = base_dir + "/" + sanitize_filename(resubmission_hash)
-                path = store_temp_file(content, filename)
-                details["path"] = path
-                details["content"] = content
-                status, task_ids_tmp = download_file(**details)
-                if status == "error":
-                    details["errors"].append({os.path.basename(filename): task_ids_tmp})
-                else:
-                    details["task_ids"] = task_ids_tmp
-                    records = perform_search("sha256", resubmission_hash)
-                    for record in records:
-                        existent_tasks.setdefault(record["target"]["file"]["sha256"], list())
-                        existent_tasks[record["target"]["file"]["sha256"]].append(record)
-            else:
-                return render(request, "error.html", {"error": "File not found on hdd for resubmission"})
-
-        elif "sample" in request.FILES:
-            samples = request.FILES.getlist("sample")
-            details["service"] = "WebGUI"
-            for sample in samples:
-                # Error if there was only one submitted sample and it's empty.
-                # But if there are multiple and one was empty, just ignore it.
-                if not sample.size:
-                    details["errors"].append({sample.name: "You uploaded an empty file."})
+                    details["errors"].append({hash: f"Can't find {hash} on disk"})
                     continue
-                elif sample.size > settings.MAX_UPLOAD_SIZE:
-                    details["errors"].append({sample.name:  "You uploaded a file that exceeds the maximum allowed upload size specified in web/web/local_settings.py."})
-                    continue
-
                 if opt_filename:
                     filename = opt_filename
                 else:
-                    filename = sanitize_filename(sample.name)
-                # Moving sample from django temporary file to CAPE temporary storage to let it persist between reboot (if user like to configure it in that way).
-                path = store_temp_file(sample.read(), filename)
-                sha256 = File(path).get_sha256()
-                if not request.user.is_staff and (web_conf.uniq_submission.enabled or unique) and db.check_file_uniq(sha256, hours=web_conf.uniq_submission.hours):
-                    details["errors"].append({filename: "Duplicated file, disable unique option on submit or in conf/web.conf to force submission"})
-                    continue
+                    # Try to recover the original filename from the task
+                    original_filename = ""
+                    if task_id:
+                        task = db.view_task(task_id)
+                        if task and task.target:
+                            original_filename = sanitize_filename(os.path.basename(task.target))
+                    filename = original_filename or sanitize_filename(hash)
+                path = store_temp_file(content, filename)
+                list_of_tasks.append((content, path, hash))
 
+        # Hack for resubmit first find all files and then put task as proper category
+        if job_category and job_category in ("resubmit", "sample", "static", "pcap", "dlnexec", "downloading_service"):
+            task_category = job_category
+
+        if task_category == "resubmit":
+            for content, path, sha256 in list_of_tasks:
+                details["path"] = path
+                details["content"] = content
+                status, tasks_details = download_file(**details)
+                if status == "error":
+                    details["errors"].append({os.path.basename(filename): tasks_details})
+                else:
+                    details["task_ids"] = tasks_details.get("task_ids")
+                    if tasks_details.get("errors"):
+                        details["errors"].extend(tasks_details["errors"])
+                    if web_conf.web_reporting.get("enabled", False) and web_conf.general.get("existent_tasks", False):
+                        records = perform_search("target_sha256", hash, search_limit=5)
+                        if records:
+                            for record in records or []:
+                                existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
+
+        elif task_category == "sample":
+            details["service"] = "WebGUI"
+            for content, path, sha256 in list_of_tasks:
                 if timeout and web_conf.public.enabled and web_conf.public.timeout and timeout > web_conf.public.timeout:
                     timeout = web_conf.public.timeout
 
                 details["path"] = path
-                details["content"] = get_file_content(path)
-                status, task_ids_tmp = download_file(**details)
+                details["content"] = content
+                status, tasks_details = download_file(**details)
                 if status == "error":
-                    details["errors"].append({os.path.basename(path): task_ids_tmp})
+                    details["errors"].append({os.path.basename(path): tasks_details})
                 else:
-                    records = perform_search("sha256", sha256)
-                    for record in records:
-                        if record.get("target").get("file", {}).get("sha256"):
-                            existent_tasks.setdefault(record["target"]["file"]["sha256"], list())
-                            existent_tasks[record["target"]["file"]["sha256"]].append(record)
-                    details["task_ids"] = task_ids_tmp
+                    details["task_ids"] = tasks_details.get("task_ids")
+                    if tasks_details.get("errors"):
+                        details["errors"].extend(tasks_details["errors"])
+                    if web_conf.general.get("existent_tasks", False):
+                        records = perform_search("target_sha256", sha256, search_limit=5)
+                        if records:
+                            for record in records:
+                                if record.get("target").get("file", {}).get("sha256"):
+                                    existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
 
-        elif "quarantine" in request.FILES:
-            samples = request.FILES.getlist("quarantine")
-            for sample in samples:
-                # Error if there was only one submitted sample and it's empty.
-                # But if there are multiple and one was empty, just ignore it.
-                if not sample.size:
-                    if len(samples) != 1:
-                        continue
-
-                    return render(request, "error.html", {"error": "You uploaded an empty quarantine file."})
-                elif sample.size > settings.MAX_UPLOAD_SIZE:
-                    return render(request, "error.html", {"error": "You uploaded a quarantine file that exceeds the maximum allowed upload size specified in web/web/local_settings.py."})
-
-                # Moving sample from django temporary file to Cuckoo temporary storage to
-                # let it persist between reboot (if user like to configure it in that way).
-                tmp_path = store_temp_file(sample.read(), sample.name)
-
-                path = unquarantine(tmp_path)
-                try:
-                    os.remove(tmp_path)
-                except Exception as e:
-                    print(e)
-
-                if not path:
-                    return render(request, "error.html", {"error": "You uploaded an unsupported quarantine file."})
-
-                details["path"] = path
-                details["content"] = get_file_content(path)
-                status, task_ids_tmp = download_file(**details)
-                if status == "error":
-                    details["errors"].append({sample.name: task_ids_tmp})
-                else:
-                    details["task_ids"] = task_ids_tmp
-
-        elif "static" in request.FILES:
-            samples = request.FILES.getlist("static")
-            for sample in samples:
-                if not sample.size:
-                    if len(samples) != 1:
-                        continue
-
-                    return render(request, "error.html", {"error": "You uploaded an empty file."})
-                elif sample.size > settings.MAX_UPLOAD_SIZE:
-                    return render(request, "error.html", {"error": "You uploaded a file that exceeds the maximum allowed upload size specified in web/web/local_settings.py."})
-
-                # Moving sample from django temporary file to Cuckoo temporary storage to
-                # let it persist between reboot (if user like to configure it in that way).
-                path = store_temp_file(sample.read(), sample.name)
-
-                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp)
+        elif task_category == "static":
+            for content, path, sha256 in list_of_tasks:
+                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp, options=options, user_id=request.user.id or 0)
                 if not task_id:
                     return render(request, "error.html", {"error": "We don't have static extractor for this"})
-                details["task_ids"].append(task_id)
+                details["task_ids"] += task_id
 
-        elif "pcap" in request.FILES:
-            samples = request.FILES.getlist("pcap")
-            for sample in samples:
-                if not sample.size:
-                    if len(samples) != 1:
-                        continue
-
-                    return render(request, "error.html", {"error": "You uploaded an empty PCAP file."})
-                elif sample.size > settings.MAX_UPLOAD_SIZE:
-                    return render(request, "error.html", {"error": "You uploaded a PCAP file that exceeds the maximum allowed upload size specified in web/web/local_settings.py."})
-
-                # Moving sample from django temporary file to Cuckoo temporary storage to
-                # let it persist between reboot (if user like to configure it in that way).
-                path = store_temp_file(sample.read(), sample.name)
-
-                if sample.name.lower().endswith(".saz"):
+        elif task_category == "pcap":
+            for content, path, sha256 in list_of_tasks:
+                if path.lower().endswith(b".saz"):
                     saz = saz_to_pcap(path)
                     if saz:
-                        try:
-                            os.remove(path)
-                        except Exception as e:
-                            pass
+                        with suppress(Exception):
+                            parent_dir = os.path.dirname(path)
+                            path_delete(path)
+                            with suppress(OSError):
+                                os.rmdir(parent_dir)
                         path = saz
                     else:
-                        return render(request, "error.html", {"error": "Conversion from SAZ to PCAP failed."})
+                        details["errors"].append({os.path.basename(path): "Conversion from SAZ to PCAP failed."})
+                        continue
 
                 task_id = db.add_pcap(file_path=path, priority=priority, tlp=tlp, user_id=request.user.id or 0)
                 if task_id:
                     details["task_ids"].append(task_id)
 
-        elif "url" in request.POST and request.POST.get("url").strip():
-            url = request.POST.get("url").strip()
-            if not url:
-                return render(request, "error.html", {"error": "You specified an invalid URL!"})
+        elif task_category == "url":
+            for _, url, _ in list_of_tasks:
+                if machine.lower() == "all":
+                    machines = [vm.name for vm in db.list_machines(platform=platform)]
+                elif machine:
+                    machine_details = db.view_machine(machine)
+                    if platform and hasattr(machine_details, "platform") and not machine_details.platform == platform:
+                        details["errors"].append(
+                            {os.path.basename(url): f"Wrong platform, {machine_details.platform} VM selected for {platform} sample"}
+                        )
+                        continue
+                    else:
+                        machines = [machine]
 
-            url = url.replace("hxxps://", "https://").replace("hxxp://", "http://").replace("[.]", ".")
-
-            if machine.lower() == "all":
-                machines = [vm.name for vm in db.list_machines(platform=platform)]
-            elif machine:
-                machine_details = db.view_machine(machine)
-                if platform and hasattr(machine_details, "platform") and not machine_details.platform == platform:
-                    return render(request, "error.html", {"error": "Wrong platform, {} VM selected for {} sample".format(machine_details.platform, platform)}, )
                 else:
-                    machines = [machine]
+                    machines = [None]
+                for entry in machines:
+                    task_id = db.add_url(
+                        url=url,
+                        package=package,
+                        timeout=timeout,
+                        priority=priority,
+                        options=options,
+                        machine=entry,
+                        platform=platform,
+                        tags=tags,
+                        custom=custom,
+                        memory=memory,
+                        enforce_timeout=enforce_timeout,
+                        clock=clock,
+                        route=route,
+                        cape=cape,
+                        tags_tasks=tags_tasks,
+                        user_id=request.user.id or 0,
+                    )
+                    details["task_ids"].append(task_id)
 
-            else:
-                machines = [None]
-            for entry in machines:
-                task_id = db.add_url(
-                    url=url,
-                    package=package,
-                    timeout=timeout,
-                    priority=priority,
-                    options=options,
-                    machine=entry,
-                    platform=platform,
-                    tags=tags,
-                    custom=custom,
-                    memory=memory,
-                    enforce_timeout=enforce_timeout,
-                    clock=clock,
-                    shrike_url=shrike_url,
-                    shrike_msg=shrike_msg,
-                    shrike_sid=shrike_sid,
-                    shrike_refer=shrike_refer,
-                    route=route,
-                    cape=cape,
-                    tags_tasks=tags_tasks,
-                    user_id=request.user.id or 0,
-                )
-                details["task_ids"].append(task_id)
+        elif task_category == "dlnexec":
+            for content, path, sha256 in list_of_tasks:
+                details["path"] = path
+                details["content"] = content
+                details["service"] = "DLnExec"
+                details["source_url"] = samples
+                status, tasks_details = download_file(**details)
+                if status == "error":
+                    details["errors"].append({os.path.basename(path): tasks_details})
+                else:
+                    details["task_ids"] = tasks_details.get("task_ids")
+                    if tasks_details.get("errors"):
+                        details["errors"].extend(tasks_details["errors"])
 
-        elif "dlnexec" in request.POST and request.POST.get("dlnexec").strip():
-            url = request.POST.get("dlnexec").strip()
-            if not url:
-                return render(request, "error.html", {"error": "You specified an invalid URL!"})
-
-            url = url.replace("hxxps://", "https://").replace("hxxp://", "http://").replace("[.]", ".")
-            response = _download_file(request.POST.get("route", None), url, options)
-            if not response:
-                 return render(request, "error.html", {"error": "Was impossible to retrieve url"})
-
-            name = os.path.basename(url)
-            if not "." in name:
-                name = get_user_filename(options, custom) or generate_fake_name()
-
-            path = store_temp_file(response, name)
-            details["path"] = path
-            details["content"] = get_file_content(path)
-            details["service"] = "DLnExec"
-            status, task_ids_tmp = download_file(**details)
-            if status == "error":
-                details["errors"].append({name: task_ids_tmp})
-            else:
-                details["task_ids"] = task_ids_tmp
-        elif settings.VTDL_ENABLED and "vtdl" in request.POST and request.POST.get("vtdl", False) and request.POST.get("vtdl")[0] != "":
-            if not settings.VTDL_KEY or not settings.VTDL_PATH:
-                    return render(request, "error.html", {"error": "You specified VirusTotal but must edit the file and specify your VTDL_KEY variable and VTDL_PATH base directory"})
-            else:
-                if opt_apikey:
-                    details["apikey"] = opt_apikey
-                details = download_from_vt(request.POST.get("vtdl").strip(), details, opt_filename, settings)
+        elif task_category == "downloading_service":
+            details = download_from_3rdparty(samples, opt_filename, details)
 
         if details.get("task_ids"):
             tasks_count = len(details["task_ids"])
         else:
             tasks_count = 0
         if tasks_count > 0:
-            data = {"tasks": details["task_ids"], "tasks_count": tasks_count, "errors": details["errors"], "existent_tasks": existent_tasks}
+            if tasks_count == 1 and not details.get("errors"):
+                return redirect("submission_status", task_id=details["task_ids"][0])
+            data = {
+                "title": "Submission",
+                "tasks": details["task_ids"],
+                "tasks_count": tasks_count,
+                "errors": details["errors"],
+                "existent_tasks": existent_tasks,
+                "remote_console": remote_console,
+            }
+            task_rows, all_terminal = _build_batch_tasks_info(request, details["task_ids"])
+            data["task_rows"] = task_rows
+            data["batch_tasks_csv"] = ",".join(str(row["id"]) for row in task_rows)
+            data["all_terminal"] = all_terminal
             return render(request, "submission/complete.html", data)
         else:
-            return render(request, "error.html", {"error": "Error adding task(s) to CAPE's database.", "errors": details["errors"]})
+            err_data = {
+                "error": "Error adding task(s) to CAPE's database.",
+                "errors": details["errors"],
+                "title": "Submission Failure",
+            }
+            return render(request, "error.html", err_data)
     else:
-        enabledconf = dict()
-        enabledconf["vt"] = settings.VTDL_ENABLED
+        if "batch_tasks" in request.GET:
+            raw_ids = [part.strip() for part in request.GET.get("batch_tasks", "").split(",") if part.strip().isdigit()][:50]
+            task_rows, all_terminal = _build_batch_tasks_info(request, raw_ids)
+            return render(
+                request,
+                "submission/_batch_tasks_table.html",
+                {
+                    "task_rows": task_rows,
+                    "batch_tasks_csv": ",".join(str(row["id"]) for row in task_rows),
+                    "all_terminal": all_terminal,
+                    "remote_console": request.GET.get("remote_console") == "1",
+                },
+            )
+
+        enabledconf = {}
         enabledconf["kernel"] = settings.OPT_ZER0M0N
         enabledconf["memory"] = processing.memory.get("enabled")
         enabledconf["procmemory"] = processing.procmemory.get("enabled")
         enabledconf["dlnexec"] = settings.DLNEXEC
         enabledconf["url_analysis"] = settings.URL_ANALYSIS
         enabledconf["tags"] = False
-        enabledconf["dist_master_storage_only"] = repconf.distributed.master_storage_only
+        enabledconf["dist_master_storage_only"] = distconf.distributed.master_storage_only
         enabledconf["linux_on_gui"] = web_conf.linux.enabled
         enabledconf["tlp"] = web_conf.tlp.enabled
         enabledconf["timeout"] = cfg.timeouts.default
+        enabledconf["amsidump"] = web_conf.amsidump.enabled
+        enabledconf["pre_script"] = web_conf.pre_script.enabled
+        enabledconf["during_script"] = web_conf.during_script.enabled
+        enabledconf["downloading_service"] = bool(downloader_services.downloaders)
+        enabledconf["interactive_desktop"] = web_conf.guacamole.enabled
+
+        all_vms_tags = load_vms_tags()
 
         if all_vms_tags:
             enabledconf["tags"] = True
@@ -467,20 +817,21 @@ def index(request, resubmit_hash=False):
             # load multi machinery tags:
             # Get enabled machinery
             machinery = cfg.cuckoo.get("machinery")
+            machinery_tags = "scale_sets" if machinery == "az" else "machines"
             if machinery == "multi":
                 for mmachinery in Config(machinery).multi.get("machinery").split(","):
-                    vms = [x.strip() for x in getattr(Config(mmachinery), mmachinery).get("machines").split(",")]
+                    vms = [x.strip() for x in getattr(Config(mmachinery), mmachinery).get(machinery_tags).split(",") if x.strip()]
                     if any(["tags" in list(getattr(Config(mmachinery), vmtag).keys()) for vmtag in vms]):
                         enabledconf["tags"] = True
                         break
             else:
                 # Get VM names for machinery config elements
-                vms = [x.strip() for x in getattr(Config(machinery), machinery).get("machines").split(",")]
+                vms = [x.strip() for x in str(getattr(Config(machinery), machinery).get(machinery_tags)).split(",") if x.strip()]
                 # Check each VM config element for tags
                 if any(["tags" in list(getattr(Config(machinery), vmtag).keys()) for vmtag in vms]):
                     enabledconf["tags"] = True
 
-        packages, machines = get_form_data("windows")
+        packages, machines = get_form_data()
 
         socks5s = _load_socks5_operational()
 
@@ -488,13 +839,10 @@ def index(request, resubmit_hash=False):
         vpn_random = ""
 
         if routing.socks5.random_socks5 and socks5s:
-            socks5s_random = random.choice(socks5s.values()).get("name", False)
+            socks5s_random = socks5s[random.choice(list(socks5s.keys()))]
 
-        if routing.vpn.random_vpn:
-            vpn_random =  random.choice(list(vpns.values())).get("name", False)
-
-        if socks5s:
-            socks5s_random = random.choice(list(socks5s.values())).get("name", False)
+        if routing.vpn.random_vpn and vpns:
+            vpn_random = vpns[random.choice(list(vpns.keys()))]
 
         random_route = False
         if vpn_random and socks5s_random:
@@ -504,47 +852,277 @@ def index(request, resubmit_hash=False):
         elif socks5s_random:
             random_route = socks5s_random
 
+        # prepare data for the gui rendering
+        if random_route:
+            if random_route is vpn_random:
+                random_route = {
+                    "name": random_route["name"],
+                    "description": random_route["description"],
+                    "interface": random_route["interface"],
+                    "type": "VPN",
+                }
+            else:
+                random_route = {
+                    "name": random_route["description"],
+                    "host": random_route["host"],
+                    "port": random_route["port"],
+                    "type": "SOCKS5",
+                }
+        socks5s_data = [
+            {"name": v["description"], "host": v["host"], "port": v["port"], "type": "socks5"} for k, v in socks5s.items()
+        ]
+        vpns_data = [
+            {"name": v["name"], "description": v["description"], "interface": v["interface"], "type": "vpn"} for v in vpns.values()
+        ]
 
-        existent_tasks = dict()
+        # nexthop gateway pool: expose the configured [gwX] profiles (and the "nexthop" pool
+        # sentinel) as route options so GUI submissions can select the pool, mirroring vpns_data.
+        # Defensive: a malformed [nexthop] config must never 500 the submission page.
+        nexthop_enabled = False
+        gateways_data = []
+        try:
+            if getattr(routing.nexthop, "enabled", False):
+                nexthop_enabled = True
+                for gw_name in str(getattr(routing.nexthop, "gateways", "") or "").split(","):
+                    gw_name = gw_name.strip()
+                    if not gw_name:
+                        continue
+                    gw = routing.get(gw_name) if hasattr(routing, gw_name) else None
+                    desc = getattr(gw, "description", None) if gw is not None else None
+                    gateways_data.append({"name": gw_name, "description": desc or gw_name})
+        except Exception:
+            nexthop_enabled, gateways_data = False, []
+
+        existent_tasks = {}
         if resubmit_hash:
-            records = perform_search("sha256", resubmit_hash)
-            for record in records:
-                existent_tasks.setdefault(record["target"]["file"]["sha256"], list())
-                existent_tasks[record["target"]["file"]["sha256"]].append(record)
+            if web_conf.general.get("existent_tasks", False):
+                records = perform_search("target_sha256", resubmit_hash, search_limit=5)
+                if records:
+                    for record in records:
+                        existent_tasks.setdefault(record["target"]["file"]["sha256"], [])
+                        existent_tasks[record["target"]["file"]["sha256"]].append(record)
 
-        return render(
-            request,
-            "submission/index.html",
+        from lib.cuckoo.common.hooks import apply_submission_context_filter
+
+        submission_ctx = apply_submission_context_filter(
             {
-                "packages": sorted(packages),
+                "title": "Submit",
+                "packages": sorted(packages, key=lambda i: i["name"].lower()),
                 "machines": machines,
-                "vpns": list(vpns.values()),
+                "vpns": vpns_data,
                 "random_route": random_route,
-                "socks5s": list(socks5s.values()),
+                "socks5s": socks5s_data,
+                "gateways": gateways_data,
+                "nexthop_enabled": nexthop_enabled,
                 "route": routing.routing.route,
                 "internet": routing.routing.internet,
                 "inetsim": routing.inetsim.enabled,
                 "tor": routing.tor.enabled,
                 "config": enabledconf,
                 "resubmit": resubmit_hash,
-                "tags": sorted(list(set(all_vms_tags))),
+                "tags": all_vms_tags,
                 "existent_tasks": existent_tasks,
-            },
+                "all_exitnodes": list(sorted(load_vms_exits())),
+            }
         )
+        return render(
+            request,
+            "submission/index.html",
+            submission_ctx,
+        )
+
+
+def _lookup_existent_tasks(request, sha256: str, current_task_id: int) -> dict:
+    existent_tasks = {}
+    if not sha256 or not web_conf.general.get("existent_tasks", False):
+        return existent_tasks
+    with suppress(Exception):
+        records = perform_search("target_sha256", sha256, search_limit=5)
+        for record in records or []:
+            rid = (record.get("info") or {}).get("id")
+            if rid is not None and int(rid) == int(current_task_id):
+                continue
+            rec_sha = record.get("target", {}).get("file", {}).get("sha256") or sha256
+            existent_tasks.setdefault(rec_sha, []).append(record)
+    return existent_tasks
+
+
+def _format_elapsed_duration(task) -> str:
+    from lib.cuckoo.core.data.db_common import _utcnow_naive
+
+    raw_status = getattr(task, "status", "")
+    if raw_status == "running":
+        ref_dt = getattr(task, "started_on", None) or getattr(task, "added_on", None)
+    elif raw_status == "completed":
+        ref_dt = getattr(task, "completed_on", None) or getattr(task, "started_on", None) or getattr(task, "added_on", None)
+    else:
+        ref_dt = getattr(task, "added_on", None)
+
+    if not ref_dt:
+        return ""
+    try:
+        total_seconds = max(0, int((_utcnow_naive() - ref_dt).total_seconds()))
+        hours, rem = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        if minutes > 0:
+            return f"{minutes}m {seconds:02d}s"
+        return f"{seconds}s"
+    except Exception:
+        return ""
+
+
+def _get_queue_position(request, task) -> int | None:
+    if getattr(task, "status", "") != "pending":
+        return None
+    with suppress(Exception):
+        from sqlalchemy import and_, func, or_, select
+        from lib.cuckoo.core.data.task import TASK_PENDING, Task
+        from lib.cuckoo.common.hooks import apply_sql_task_filter
+
+        prio = getattr(task, "priority", 1) or 1
+        tid = int(task.id)
+        stmt = (
+            select(func.count(Task.id))
+            .where(Task.status == TASK_PENDING)
+            .where(or_(Task.priority > prio, and_(Task.priority == prio, Task.id < tid)))
+        )
+        stmt = apply_sql_task_filter(stmt)
+        with db.session.begin():
+            ahead = db.session.scalar(stmt) or 0
+        return int(ahead) + 1
+    return None
+
+
+def _get_static_preview_settings():
+    cfg_section = getattr(web_conf, "static_preview", None)
+    if cfg_section is not None and hasattr(cfg_section, "get"):
+        enabled = bool(cfg_section.get("enabled", False))
+        on_demand = bool(cfg_section.get("on_demand", True))
+        allow_stop = bool(cfg_section.get("allow_stop", True))
+    else:
+        enabled = False
+        on_demand = True
+        allow_stop = True
+    return enabled, on_demand, allow_stop
 
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def status(request, task_id):
+    from django.http import HttpResponseForbidden
+
+    from submission.static_preview import get_static_preview
+
     task = db.view_task(task_id)
     if not task:
         return render(request, "error.html", {"error": "The specified task doesn't seem to exist."})
 
+    static_preview_enabled, static_preview_on_demand, allow_stop_analysis = _get_static_preview_settings()
+    stop_requested = False
+
+    if request.method == "POST":
+        action = request.POST.get("action", "stop")
+        if action == "stop":
+            if not allow_stop_analysis:
+                return HttpResponseForbidden("Stopping analysis is disabled.")
+            stop_res = stop_analysis_task(task_id, mode="stop")
+            if not stop_res.get("error"):
+                stop_requested = True
+            task = db.view_task(task_id) or task
+
+    if request.GET.get("static") == "1":
+        if not (static_preview_enabled or static_preview_on_demand):
+            return HttpResponseForbidden("Static preview is disabled.")
+        preview = get_static_preview(task, run_full=True) or {}
+        sha256 = preview.get("file", {}).get("sha256", "")
+        preview["task_id"] = task_id
+        preview["task_status"] = task.status
+        preview["allow_stop_analysis"] = allow_stop_analysis and task.status in ("pending", "running", "distributed")
+        preview["existent_tasks"] = _lookup_existent_tasks(request, sha256, task_id)
+        return render(request, "submission/_static_preview.html", preview)
+
     completed = False
     if task.status == "reported":
-        return redirect("report", task_id=task_id)
+        if request.headers.get("HX-Request"):
+            completed = True
+        else:
+            return redirect("report", task_id=task_id)
 
     status = task.status
     if status == "completed":
         status = "processing"
 
-    return render(request, "submission/status.html", {"completed": completed, "status": status, "task_id": task_id})
+    if status == "running" and not stop_requested:
+        with suppress(Exception):
+            if db.guest_get_status(task_id) == "stopping":
+                stop_requested = True
+
+    interactive = bool(web_conf.guacamole.enabled and get_options(task.options).get("interactive") == "1")
+    can_stop = bool(allow_stop_analysis and status in ("pending", "running", "distributed") and not stop_requested)
+    has_static_target = getattr(task, "category", "") != "url" and (
+        getattr(task, "category", "") in ("file", "static", "archive") or bool(getattr(task, "sample", None))
+    )
+
+    response = {
+        "title": "Task Status",
+        "completed": completed,
+        "status": status,
+        "task_id": task_id,
+        "interactive": interactive,
+        "session_data": "",
+        "queue_position": _get_queue_position(request, task) if not completed else None,
+        "elapsed_time": _format_elapsed_duration(task) if not completed else "",
+        "target": task.sample.sha256 if getattr(task, "sample") else task.target,
+        "static_preview_enabled": static_preview_enabled and has_static_target,
+        "static_preview_on_demand": static_preview_on_demand and has_static_target,
+        "allow_stop_analysis": can_stop,
+        "stop_requested": stop_requested,
+        "task_status": task.status,
+    }
+    if interactive and task.status == "running" and not stop_requested:
+        machine = db.view_machine_by_label(task.machine) if task.machine else None
+        if machine:
+            guest_ip = machine.ip
+            session_id = uuid3(NAMESPACE_DNS, str(task_id)).hex[:16]
+            session_data = urlsafe_b64encode(f"{session_id}|{task.machine}|{guest_ip}".encode("utf8")).decode("utf8")
+            response["session_data"] = session_data
+
+    # Populate instant Tier-1 static file info on initial page load when enabled (skipped during 5s HTMX #status-card polls).
+    if not request.headers.get("HX-Request") and static_preview_enabled:
+        preview = get_static_preview(task, run_full=False)
+        if preview:
+            response.update(preview)
+            sha256 = preview.get("file", {}).get("sha256", "")
+            response["existent_tasks"] = _lookup_existent_tasks(request, sha256, task_id)
+
+    return render(request, "submission/status.html", response)
+
+
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+def remote_session(request, task_id):
+    task = db.view_task(task_id)
+    if not task:
+        return render(request, "error.html", {"error": "The specified task doesn't seem to exist."})
+
+    machine_status = False
+    session_data = ""
+
+    if task.status == "running":
+        machine = db.view_machine_by_label(task.machine)
+        if not machine:
+            return render(request, "error.html", {"error": "Machine is not set for this task."})
+        guest_ip = machine.ip
+        machine_status = True
+        session_id = uuid3(NAMESPACE_DNS, str(task_id)).hex[:16]
+        session_data = urlsafe_b64encode(f"{session_id}|{machine.label}|{guest_ip}".encode("utf8")).decode("utf8")
+
+    return render(
+        request,
+        "submission/remote_status.html",
+        {
+            "running": machine_status,
+            "task_id": task_id,
+            "session_data": session_data,
+        },
+    )

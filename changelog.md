@@ -1,3 +1,1435 @@
+### [04.11.2026]
+* Signature engine performance & correctness:
+    * **Evented dispatch cache**: the per-API-call set algebra in `RunSignatures.run()` is memoised on `(api, category)`, wiring up the `self.api_sigs` cache that was declared but never used. 4.14s -> 2.40s for 200k calls against 200 no-op signatures.
+    * **TTP de-duplication**: replaced the O(n^2) `not in self.ttps` scan with a set of `(ttp, signature)` pairs.
+    * **Signature timings**: `statistics.signatures[].time` reported a leaked loop variable, so every evented signature got the same duration. It now reports each signature's own accumulated time.
+    * `RunReporting.__init__` used `break` where `continue` belongs, which could leave `ParseProcessLog` instances unconverted for later processes.
+* Machinery and auxiliary wait paths:
+    * `qemu.stop()` called `proc.wait()` with no timeout, so a wedged qemu held the machinery thread forever. The timeout loop written below it was unreachable, because `wait()` had already returned by the time it was evaluated. Replaced with a bounded wait that escalates `system_powerdown` -> `SIGTERM` -> `SIGKILL`.
+    * `virtualbox.stop()` polled `proc.poll()` on a one-second tick, rounding every machine stop up to the next whole second, and its timeout branch called `proc.terminate()` with no sleep, spinning at 100% CPU until the process died. Now a single `communicate(timeout=...)`, which also drains stdout/stderr instead of leaving VBoxManage able to block on a full pipe.
+    * `hyperv.run_cmd()` opened a new SSH connection per command; `start()` alone did four handshakes. Commands now share one `ControlMaster` connection, run without `shell=True`, and have a deadline.
+    * `hyperv.start()` waited with `while not self._is_running(id): continue`, issuing remote status queries as fast as the host could spawn SSH processes, with no upper bound. Now polls every 2s and fails after 300s.
+    * `QemuScreenshots` opened and closed a libvirt connection every second, per analysis. One connection per thread now, reconnecting on error. Its `finally` block also referenced `stream` before assignment when `lookupByName` failed, turning a libvirt error into a `NameError`.
+    * `Mitmdump.wait_for_pid_exit` polled on a flat one-second tick after `SIGTERM`, adding up to a second to every teardown. Now backs off from 10ms.
+* Elasticsearch reporting and JSON dump:
+    * `ElasticSearchDB.run()` performed `json.loads(json.dumps(report), object_hook=date_hook)` **before** `insert_calls`, so the entire behaviour log was serialised and re-parsed only to be discarded on the next line. The round-trip now runs after the calls have been moved to the calls index. 200k calls: 7.36s -> 2ms.
+    * `date_hook` attempted `strptime` on every value in the report tree, building an exception for each int, list and non-date string. A leading digit plus a `-` plus a `:` are all necessary for `"%Y-%m-%d %H:%M:%S"` to parse, so guarding on them converts exactly the same values: a further 4.2x on the remaining work.
+    * `jsondump` with `store_compressed` built the whole archive in a `BytesIO` and then copied it out with `getvalue()`. It now writes the zip directly to disk. No speed change, lower peak memory. The archive entry name is unchanged.
+* Behaviour processing performance:
+    * `Summary` guarded roughly thirty appends with `value not in self.<list>`, once per matching API call, against lists that reach thousands of entries. The accumulators are now insertion-ordered containers with a set-backed membership test and are unwrapped to plain lists in `run()`. 100k appends across 10k unique values: 7.0s -> 4.8ms. Output verified identical with `replace_patterns` both off and on.
+    * `EncryptedBuffers` tested `buf not in self.bufs`, comparing a `str` against a list of `dict`s. That is always true, so no buffer was ever deduplicated and every check walked the whole list. 20k buffers: 3.0s -> 2.3ms. Reports now contain unique buffers per API.
+    * `EncryptedBuffers` also recorded every `CryptEncryptMessage` call twice, because `startswith("CryptEncrypt")` matches it as well.
+    * `ProcessTree.event_apicall` scanned the collected process list on every API call. 1M calls across 200 processes: 2.6s -> 18ms.
+* PCAP processing performance:
+    * `Pcap._add_hosts` tested membership against `self.hosts`, a list, once per packet. Destinations already seen are now rejected by an O(1) set before `convert_to_printable`, `ipaddress.ip_address` and the passlist walk run again. 200k packets across 5k unique hosts: 7.9s -> 5ms.
+    * `Pcap._enrich_hosts` rescanned every DNS answer for every host. The answer-to-hostname map is now built once. 5k hosts against 20k DNS requests: 2.1s -> 12ms.
+    * Output is unchanged: verified against the previous implementation over 200 randomised packet streams covering IPv6, malformed addresses, ICMP without a dport, passlisted and private addresses.
+* MongoDB write path:
+    * `mongo_update_one` and `mongo_delete_one` passed `hint=[("_id", 1)]` unconditionally. For callers filtering on other fields such as `info.id` or `info.job_id` (`utils/dist.py`, `lib/cuckoo/common/cleaners_utils.py`, `lib/cuckoo/core/data/tasking.py`), that forced a full scan of the `_id` index and prevented the query planner from using specialized indexes like `info_id_desc`. The hint is now applied only when the filter is keyed on `_id`.
+* Windows analyzer result uploads:
+    * Screenshots, the DigiSig report and the pre/during script output were written to the result server with bare `socket.send()` calls, iterating the payload as *lines*. Binary data splits on every `0x0A` byte, so a 155 KB screenshot went out as 762 socket writes (smallest 1 byte) instead of one.
+    * Those calls also discarded the `send()` return value (a short write silently truncated the upload) and bypassed `NetlogConnection.send()`, which reconnects and retries once.
+    * Added `NetlogConnection.send_fileobj()`, which reads fixed-size chunks and sends them through `sendall()` with the existing retry. Upload granularity is unchanged: one connection and one file per upload.
+* Windows analyzer file bookkeeping (`analyzer/windows/analyzer.py`):
+    * `Files.dumped` is a set instead of a list. It is only ever tested for membership, and the linear scan cost 6.46 s in total across a 30,000 file run (688 ms at 10,000) versus 3.74 ms for a set.
+    * `Files.dump_files()` takes the next pending path directly instead of rebuilding the entire key list on every iteration, which was O(n^2): 3.82 s at 30,000 files, 308 ms at 10,000. It still re-checks the dict each time, because pipe handler threads can add files while it drains.
+* Windows analyzer process loop (`analyzer/windows/analyzer.py`):
+    * `analysis_loop()` iterated the live pid list while `remove_pid()` removed from it, so the iterator skipped the entry after every removal. Five processes exiting together took several one-second iterations to drain, delaying both `upload_memdump()` and the "process list is empty, terminating analysis" check.
+    * `_normalized_protected_path()` compared `path[-1]` (an `int`, because the value is `bytes`) against `b"\\"`, so the check was always true and a directory ending in a separator got a second one appended - after which `in_protected_path()` could not match anything below it.
+* Windows analyzer pipe server (`analyzer/windows/lib/core/pipe.py`):
+    * `PipeServer.run()` retried `CreateNamedPipeW` with no delay and no limit. A pipe name that cannot be created turned the thread into a spin loop that burned a core and flooded the log for the rest of the analysis. It now backs off 100 ms and gives up after 100 consecutive failures.
+    * `PipeDispatcher._read_message()` accumulated `buf.value`, which stops at the first NUL byte and ignores the byte count the API reports, so a message containing an embedded NUL was truncated and its tail was parsed as a new command. It now uses `buf.raw[:bytes_read.value]` and strips the trailing NUL terminator.
+    * Finished handler threads are dropped from `PipeServer.handlers` instead of being retained for the whole analysis.
+* Windows analyzer human interaction (`analyzer/windows/modules/auxiliary/human.py`):
+    * The main loop incremented a counter once per iteration and used it as a second count, but an iteration is not one second: `realistic_human_cursor_movement()` runs for 5 seconds on its own and `move_mouse_realistically()` sleeps per step. Every schedule keyed on that counter - the document window pass at 45/30 seconds and the foreground window switch at 15 + randoff - stretched by however long the sample made the loop take. They now use `time.monotonic()` deadlines.
+
+### [02.11.2026]
+* Tenancy & Object Storage (`lib/tenancy/`, `utils/submit.py`, `utils/gcp_pubsub_service.py`):
+    * Replaced legacy `custom="job_id=..."` / `info.job_id` / `"ui-<id>"` / `"local-<id>"` indirection with universal `Task.attributes` (`main_task_id`, `task_acl`, `correlation_id`) and direct `<prefix>/<task_id>/<relpath>` object storage paths.
+    * Added `attributes` parameter forwarding to `utils/submit.py:submit_file` and wired PubSub payload metadata (`correlation_id`, `parent_id`, `transaction_id`, `source`, `main_task_id`, `task_acl`) into `task_attributes` in `utils/gcp_pubsub_service.py`.
+* Multitenancy & Cloud Object Storage (`lib/tenancy/`, `[multitenancy]`, `[object_storage]`):
+    * Extracted multi-tenancy and remote object storage into the opt-in `lib.tenancy` package behind lightweight hooks (`lib/cuckoo/common/hooks.py`), leaving single-tenant installs free of runtime and schema overhead.
+    * Added Django `Group`-native tenancy and per-group sandbox resource entitlements (`GroupSandboxPolicy` for VMs, network routes, and machine tags), side-table `TaskAcl` with monotonic `visibility_seq` compare-and-swap (CAS) synchronization, and vendor-neutral object storage backends (`s3`, `gcs`, `azure`, `local`).
+    * Added `utils/tenancy_reconcile.py` (`--dry-run`, `--adopt-public-from-reports`, `--demote-public`, `--task <id>`) to restamp MongoDB/Elasticsearch reports, preserve public task visibility in `task_acl`, and drop legacy inline-tenancy SQL columns when upgrading an install that ran the earlier inline tenancy code (see `docs/book/src/usage/multitenancy.rst`).
+
+### [14.10.2026]
+* `analyzer/windows`: expand environment variables in `executiondir`/`curdir` in `Process.execute()`, fall back to `CreateProcessW` without `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` when launching with `explorer.exe` as parent fails (e.g. `ERROR_ELEVATION_REQUIRED` on installers with `requireAdministrator` manifests), and keep the analysis running for the full timeout when `enforce_timeout` is enabled even if `package.start()` fails.
+
+### [08.10.2026]
+* `extra/browser_extension`: capture `requestBody` (`formData` and decoded `raw` bytes up to 4 KB) via `webRequest.onBeforeRequest`, record HTTP `statusCode` in `onCompleted`, correlate lifecycle events by `requestId` with O(1) deduplication, debounce event flushing, and fix the `browser.downloads.onChanged` listener registration.
+
+### [06.10.2026]
+* Browser extension (URL analysis with `firefox_ext`/`chromium_ext` and `extra/browser_extension`):
+    * `browsermonitor`: find the requests log written by agent >= 0.20 (random `%TEMP%` folder without the `tmp` prefix) and upload the last complete version once, when the analysis ends.
+    * `firefox_ext`/`chromium_ext`: stop returning the `webbrowser.open()` bool as a PID, which ended the analysis a few seconds after opening the URL.
+    * Agent 0.23: `/browser_extension` releases its lock on errors and writes the log atomically as UTF-8.
+
+### [16.09.2026]
+* Monitor updates:
+    * Misc enhancements & fixes (see capemon repo for details)
+
+### [14.09.2026]
+* `utils/community.py` install safety:
+    * **Blocklist now works**: entries were compared against the absolute destination path while the file documents them as `"signatures/my_amazing_signature.py"`, so nothing was ever blocklisted. The documented relative form, the bare path inside the category and an absolute path are all accepted now.
+    * **`--clean` is rooted at `CUCKOO_ROOT`**: it called `shutil.rmtree()` on the relative category path, deleting relative to the current working directory.
+    * **New `-sc/--shadow-core`**: community files install into the same directories as core modules, with no namespacing, so a community file with a core path replaces it. Those paths are now skipped and listed unless this flag is passed.
+### [22.08.2026]
+* Performance & Database Infrastructure:
+    * **psycopg3 Support**: Upgraded the PostgreSQL database connection driver to `psycopg` (v3) for modern async capability and massive performance gains.
+    * **In-Memory Connection Upgrader**: Added a seamless backward-compatibility layer in `lib/cuckoo/core/database.py`. If `postgresql://` is used with psycopg v3 installed, CAPEv2 automatically and transparently upgrades it in-memory to use the `postgresql+psycopg://` driver, preventing any startup `ImportError` or configuration crashes!
+
+* Sniffer fixes (`modules/auxiliary/sniffer.py`):
+    * No longer emits bare `'` tokens into the tcpdump argv. The quoting was unbalanced in 4 of the 6 `remote`/`custom`/`bpf` combinations, which made tcpdump reject the filter (local) or bash reject the generated script (remote); both failures were silent and produced an empty pcap.
+    * The remote command is now built with `shlex.join`, so parentheses and other shell metacharacters from `custom`/`bpf` reach tcpdump intact.
+    * `stop()` no longer treats a clean tcpdump exit as "still running" (`poll()` returns `0`, and `not 0` is True); it reports the captured stderr instead of trying to kill a dead process.
+    * `self.pid` is initialised in `__init__`, so `stop()` after a failed remote `start()` no longer raises `AttributeError`.
+    * Added `timeout=` to the `ps --ppid` call, dropped a duplicate stat of the tcpdump path, and replaced a `log.exception` used outside an `except` block.
+
+* Sniffer latency (`modules/auxiliary/sniffer.py`):
+    * `sudo --list <tcpdump>` is cached for the lifetime of the process. It ran on every task start and was measured at 333-348 ms on a host with a directory-backed sudoers policy. Restart the scheduler after changing sudoers.
+    * That probe also gained `timeout=30` and no longer leaks its output to the scheduler's stdout.
+    * ssh/scp use connection multiplexing (`ControlMaster`/`ControlPath`/`ControlPersist`) plus `BatchMode=yes`, so the remaining calls for a task share one TCP connection and one authentication instead of re-handshaking, and a missing key fails instead of blocking on a password prompt.
+    * The remote sniffer is started with a single ssh invocation that feeds the script on stdin and reads the pid from stdout, replacing scp + ssh + `ssh cat` + `ssh rm` (4 round trips down to 1) and leaving no script or pid file behind.
+    * Remote tcpdump output goes to `/tmp/cape-sniffer-<task id>.{log,err}` instead of the shared `/tmp/log` and `/tmp/err`, which concurrent tasks were overwriting, and both files are removed in `stop()`.
+
+### [31.07.2026]
+* Remus detection & dynamic config extraction
+
+### [15.07.2026]
+* Monitor update: Fix issue with NtWriteFile hook causing detonation failures (e.g. 9b1717eb154011b52aa24e4d6848976a9aafff2665f3171265aa767d5951be6c)
+
+### [07.07.2026]
+* Monitor updates:
+    * New hooks for SystemFunction036, SystemFunction040, SystemFunction041 (RtlGenRandom, RtlEncryptMemory, RtlDecryptMemory), Thread32First, Thread32Next, clipboard functions
+    * Enable hooks: MapFileAndCheckSumA, GetVolumeInformationA, GetVolumeInformationW & NtQueryVolumeInformationFile
+    * Crypto hook overhaul
+    * Misc fixes
+
+### [08.06.2026]
+* Threat Discovery & Hunting Workstation Dashboard:
+    * Integrated centralized dynamic multi-faceted database clustering across 12 categories (Domains, IPs, Mutexes, Dropped Files, Commands, Registry Keys, Hashes, ImpHashes, and Signatures).
+    * Created dynamic, cascading, auto-reloaded JSON configuration cacher (`conf/hunt.json`) with hierarchical lookup order (`custom/conf` ➔ `conf` ➔ `conf/default`).
+    * Built high-performance, memory-speed caching system utilizing OS modification-time (`mtime`) checks for instant reloading without disk parsing or server restarts.
+    * Integrated inline threat intelligence OSINT pivoting links (VirusTotal, Shodan, Censys, MalwareBazaar, and AlienVault OTX) and transaction-safe, sanitized AJAX-based task tagging group actions.
+    * Added comprehensive unit testing covering all view states, error handling, and security measures.
+
+### [05.06.2026]
+* Monitor updates:
+    * NtCreateUserProcess hook: Dynamically patch ping commandline to thwart ping delays (e.g. Formbook/Xloader)
+    * Debugger: Persistent software breakpoints via softbpmode=1 (default is one-shot)
+    * TLS capture improvements
+
+### [01.06.2026]
+* Monitor update: Fix standalone mode broken since August
+
+### [29.05.2026]
+* Monitor updates:
+    * Debugger: Action target argument enhanced with keywords "src", "dst", "&src" & "&dst" (e.g. action0=dumpimage:&src) for instruction parsing
+    * Debugger: Add ignored non-internal breakpoints to analysis log
+
+### [28.05.2026]
+* Monitor update: Fix issue with hooking very small 32-bit functions (e.g. GetCommandLineA/W)
+
+### [13.05.2026]
+* Update Formbook (Xloader) dynamic config extractor
+* Monitor updates:
+    * Enhance 'string' debugger action to work without target by iterating through registers
+    * Add pid to log output in DumpSectionViewsForPid()
+    * Fix bug with GetAccessibleSize() causing rare access violations
+
+### [08.05.2026]
+* Monitor update: fix COM hooks
+
+### [05.05.2026]
+* Monitor updates:
+    * Instrumentation callback: refine dll filtering and add kernelbase.dll (syscall hooks)
+    * Unpacker: refine entropy-based detection of shellcode within mapped images, don't drop tracked regions in FreeHandler()
+
+### [26.03.2026]
+* Monitor update: RtlDispatchException hook: check module_name pointer before dereference
+* KVMRemote machinery updated and  moved to main repo
+* New Hyper-V machinery module
+
+### [17.03.2026]
+* Monitor updates:
+    * Fix issue with multiple DumpCount increments causing excessive dump limiting
+    * AddTrackedRegion: Remove logging failure of GetEntropy()
+    * Fix GetTrackedRegion() issue with empty list entry
+    * 64-bit browser compatibility: enhance CheckDontMonitorList() for 64-bit paths
+    * Add option: include-apis - colon-separated list of apinames
+    * ClearThreadBreakpoint: only call ClearThreadBreakpoint() if address set, improve debug output in ClearDebugRegister()
+    * SetFileInformationByHandle: standardise FILE_DEL message
+    * Debugger: Fix iterator invalidation bug in ClearSoftwareBreakpoints(), ClearSoftwareBreakpointsInRange()
+
+### [06.03.2026]
+* Monitor update: Thread resume: fix issue with thread id passed in RESUME: message causing detonation issues
+
+### [02.03.2026]
+* PPLinject V2: Compatibility with all Win10 (22H2+) & Win11 (<=23H2)
+* Monitor updates:
+    * Disable manifest generation: prevent mui load attempts on 22H2+
+    * WMI fixes (thanks doomedraven)
+
+### [18.02.2026]
+* UPX Unpacker: enable import reconstruction
+* Monitor updates:
+    * Fix issue with VerifyHeaders() checking EP RVA in file: FileOffsetFromRVA()
+    * Add pids to FILE_NEW, FILE_DEL & FILE_MOVE monitor messages to accompany analyzer fix
+    * New hooks: RtlRemoveVectoredExceptionHandler, UnhandledExceptionFilter, GetPhysicallyInstalledSystemMemory, K32EnumProcesses, WTSEnumerateProcessesW, WTSEnumerateProcessesExW, LdrGetDllHandleEx, WTGetSignatureInfo, RtlWow64SetThreadContext
+    * YaraHarness: add 'coverage' action to remove dll from system 'range'
+    * Trace: improve recognition and handling of distinct code regions during debugging/tracing, expand ProcessOEP() action to allow shellcode dumping, refine StrTest(W) functions to filter more control characters from debugger log
+    * Add ntdll unhook protection (ntdll-unhook=1) via prevent_module_unhooking() from NtReadFile hook
+    * Add general hook protection (hook-protect=1) to protect hooks other than ntdll (ntdll-protect) - off by default
+    * Hooking: replace (allocating) convert_address_to_dll_name_and_offset() with non-allocating get_module_name()
+
+### [11.02.2026]
+* Guacamole integration:
+    * New dependency `channels[daphne]>=4.0.0` added.
+
+### [04.02.2026]
+* Network Analysis:
+    * Integrated process mapping directly into `network` processing module.
+    * Added ability to show network details (DNS, HTTP, TCP/UDP) captured from behavioral analysis in the network results.
+    * This allows recovery of network activity that might be missing from PCAP (e.g., due to capture evasion or failed interception).
+    * Centralized network utility functions into `lib/cuckoo/common/network_utils.py` for better maintainability and performance.
+    * New configuration option `process_map` under `[network]` section in `processing.conf`.
+* Web UI:
+    * Added Process Name and PID columns across all network analysis views (TCP, UDP, ICMP, DNS, HTTP, IRC, SMTP).
+
+### [28.01.2026]
+* CAPE Agent:
+    * Ported to Golang for improved stealth, performance, and zero-dependency deployment.
+    * Implemented strict host-only security (localhost blocking) and optional Token Authentication.
+    * Added secure `/push` endpoint for host-driven file retrieval.
+    * Added `/update` endpoint for seamless remote agent updates.
+* Distributed Cluster:
+    * New Go Fast-Fetcher: High-concurrency retrieval module supporting direct NFS copy.
+    * Added JSON configuration support for the fetcher to secure database credentials.
+    * Added `ignore_patterns` support for optimized cluster reporting.
+* Web UI / UX Improvements:
+    * Fixed badge readability: Enforced high-contrast text (e.g., black on yellow/info) and fixed unreadable hover states.
+    * Categorized search help table into logical groups (General, File, Network, Behavior).
+    * Fixed search box highlight color to match the theme.
+* Search Optimization:
+    * General search terms are now handled as strings (exact match) by default instead of regex to significantly improve database performance.
+    * Regex search is automatically triggered when using special characters (e.g., `^ $ | ? * + ( ) [ ] { }`).
+    * Updated search UI help and placeholders.
+
+### [16.01.2026] CAPE v2.5
+* Bootstrap 5 upgrade and some visual WEBGUI rewamp. Some improvements still might come soon!
+* htmlreport - rewamp!
+* cape2.sh - Libvirt + YARA python libraries install without external scripts.
+* Datatime UTC normalization on tasks/VMs changes.
+* Added check on startup for enable firewall.
+* Volatility3 - more modules added. Test them and let us know if you have any issue.
+* Filedescripts leaks fixed.
+* Stucked VM monitoring and kill. [PR](https://github.com/kevoreilly/CAPEv2/pull/2809)
+
+PS no changes required to CAPA library to support CAPE v2.5 ;)
+
+### [02.01.2026]
+* CAPE installer:
+    *  now support custom destination folder env variable:
+        * `CAPE_ROOT=<path>/CAPEv2`
+    * UV support with env variable:
+        * `USE_UV=True`
+    * Example:
+        * `USE_UV=True CAPE_ROOT=/mnt/external/CAPEv2 bash cape2.sh all | tee cape2.log`
+
+### [24.11.2025]
+* Monitor update: Fix issue with RESUME: monitor message from NtResumeProcess hook
+
+### [17.11.2025]
+* Monitor update: Add config option for monitor injection into supplied pid or "explorer" for shell: monitor=<pid/"explorer">
+
+### [06.11.2025]
+* Monitor updates:
+    * path_from_object_attributes(): fix issue with memcpy from bad ObjectName->Buffer (e.g. 0a9d9b402fb39cf8df21ca4e68b84577c39b3ecf00415c999b28fcc92a695663)
+    * Fix/improve exception handling code which queries current SEH handler
+    * Harden our_stackwalk() against invalid stack pointers (hooking_64)
+    * Add exported function name logging to thread hooks: NtCreateThreadEx, CreateThread, NtQueueApcThread, NtQueueApcThreadEx
+
+### [03.11.2025]
+* Rhadamanthys:
+    * static config extraction - thanks @YungBinary
+    * anti-anti detonation bypass
+
+### [22.10.2025]
+* Add monitor injection to previously unused RESUME: monitor message handler _handle_resume()
+* Remove obsolete 'suspended' parameter from PROCESS monitor message
+* Monitor updates:
+    * WriteMemoryHandler: prevent analysis log spam for small PE writes
+    * Cap per-process messages to prevent detonation slow-down & failure in e.g. 9f8333d81c13ea426953b758140836cff2cf7e7f32e36738f118c6257c6efd34
+    * Experimental debugger action 'guard' to trap on guard violation
+    * YaraHarness: write rules canary detection to analysis log & simplify 'dump' option
+    * Deprecate Win7 wow64 breakpoint workaround
+    * Implement Gemini suggestions from #111
+    * Merge pull request #111 from StephanTLavavej/unordered_map
+    * Improve NtContinueHandler debug register stealth/protection to allow detonation of e.g. 8443224de889424012ba57ec075fec219104fffa8c3ae13a2db27b4ba9d71a3b
+
+### [13.10.2025]
+* Monitor updates:
+    * Fix debug output for dump-limit config setting
+    * Expand 'DumpImage' debugger action to handle target imagebase address e.g. action0=dumpimage:0x400000,action1=dumpimage:ecx+0x280
+    * GetFunctionByName: bug fixess and improvements (thanks @heck-gd)
+    * Trace: fix issue with long conditional jump target calculation in InstructionHandler()
+
+### [06.10.2025]
+* Monitor update: Improve debugger breakpoint protection, fixes instruction counting anti-debug detection in CheckPoint ShowStopper (thanks @cccs-mog)
+
+### [03.10.2025]
+* Monitor update: Fix issue with hook_restore config setting being ignored (fixes #2715 - thanks @federicofantini)
+
+### [23.09.2025]
+* Monitor updates:
+    * unhook: attempt restoration of detected hook modifications
+    * config: fix issue parsing multiple sysbp addresses supplied via submission option
+    * Trace: don't step over named exported functions if trace-all set
+    * Tweak tracking of regions from syscall capture (InstrCallback.c)
+    * Enhance VerifyHeaders() to include EP bytes to detect shellcode overwrites (e.g. HijackLoader)
+
+### [2.09.2025]
+* Loader update: set patched import directory size to allow RestoreHeaders() to work properly, and hence VMProtect binaries
+
+### [1.09.2025]
+* Monitor update: CoCreateInstance hook: remove disable_sleep_skip() breaking e.g. 493b6a86546ac79b7647bd6f3c3523dd910e6a56e427c45197e957e268df8df2
+* Tweak StealcV2 date check bypass sig to improve coverage
+
+### [27.08.2025]
+* Monitor updates:
+    * FindFixAndRun hook: Internal cmd.exe hook targeting 'Exorcism' api FindFixAndRun for batch deobfuscation (thanks @KingKDot and @KillerInstinct)
+    * Remove Scylla code preventing dumping of MEW executables (thanks @shuiyc)
+
+### [18.08.2025]
+* Monitor update: YaraHarness: fix issue with ParseOptionLine() adding imagebase to sysbps (thanks @ClaudioWayne)
+
+### [13.08.2025]
+* Monitor update: Fix internal WMI_GetObjectAsync yara
+
+### [05.08.2025]
+* Monitor updates:
+    * Enhance dynamic patching capability: new PatchBytes() function, submission/yara option patch=<address>:<bytes>
+    * Create DumpStrings debugger action for corresponding function
+    * Standalone mode improvements (thanks heck-gd)
+    * Improve NtGetContextThread & NtSetContextThread hooks to handle e.g. a2d4e1c831808d0a791608db40cd1e4df598e5fee4bac1b239d4f8194f8e2d4a
+    * Debugger: add flag changes to trace output
+* Stealc V2 detection, dynamic strings & config extraction (requires accompanying CAPE-parsers update)
+
+### [11.06.2025]
+* __Action required!__ For users of Python 3.12+ in guest, update the agent to solve #2621 affecting e.g. MSI detonation
+* Agent update: Fix issue with analyzer directory creation lacking required ACLs for Python 3.12, remove predictable "tmp" prefix for directory name(s) (fixes #2621)
+
+### [10.06.2025]
+* Monitor update: WMI hooks: add handling for VT_NULL and enable WMI_Get logging
+
+### [06.06.2025]
+* Monitor updates:
+    * WMI hooks
+    * Fix format string vulnerability in debugger StringsOutput() function
+
+### [03.06.2025]
+* Monitor update: Fix bug in retarget_relative_displacement() relative offset calculation (thanks @ClaudioWayne)
+
+### [23.05.2025]
+* Socks5Systemz update: detection & config extraction, parser update also required (CAPE-parsers repo)
+* Monitor updates:
+    * Trace: do not wrap GetExportNameByAddress() in try/catch and do not use StepOverRegister in BreakOnReturnCallback()
+    * Debugger: fix br1 (break on return) config option parsing (config.c)
+    * Replace remaining uses of pipe("INFO:...) with DebugOutput()
+    * Trace: switch from using ScyllaGetExportNameByAddress() to GetExportNameByAddress()
+    * Harden ScanForExport() function (used by GetExportNameByAddress())
+
+### [8.05.2025]
+* PPLInject: Improve logging output if DLL transaction fails due to insufficiently large transaction target DLL in %SYSTEM%
+* Monitor update: Allow monitor to load without config ini file - defaults to standalone mode
+
+### [28.04.2025]
+* Monitor updates:
+    * .NET JIT cache dumps: off by default, configurable limit with option jit-dumps=X
+    * Windows Loader Snaps: vDbgPrintExWithPrefixInternal hook & option 'snaps=1' for loader snaps output in analysis log
+    * Disable AMSI dumps by default (and uncheck web submission tickbox)
+    * Native hookset (ntdll only) option: native=1
+    * CryptDuplicateKey hook (thanks @KillerInstinct)
+
+### [02.04.2025]
+* Monitor updates:
+    * Trace: allow custom stepping behavior with 'stepmode' option, stepmode=1 steps into short calls (e.g. Rhadamanthys control flow flattening)
+    * Hooking: replace sprintf calls with internal non-allocating implementation (num_to_hex(), uuid_to_string())
+    * CommandLineToArgvW hook
+* Cleaners update
+    * Now you can specify time range as 12h, 50m, 3d.
+    * Improved bulk cleanup for speed. Mongodb's calls collection now has task_id value. This allows to cleanup it faster.
+    * Servers that runs for years, might need to update their `tasks_tags` table schema by hand, only if you getting `ForeignKey violation`.
+```
+    ALTER TABLE tasks_tags DROP CONSTRAINT tasks_tags_task_id_fkey, ADD CONSTRAINT tasks_tags_task_id_fkey FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE;
+    ALTER TABLE tasks_tags DROP CONSTRAINT tasks_tags_tag_id_fkey, ADD CONSTRAINT tasks_tags_tag_id_fkey FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE;
+```
+
+### [14.03.2025] CAPA and FLOSS
+* CAPA and FLOSS configs are moved to `integrations.conf`
+
+### [01.03.2025] VirusTotal and MalwareBazaar
+* We have moved VirusTotal and MalwareBazaar to generic downloader so you can enable then in `integrations.conf`
+    * Downlod service allows you to set order + simplifies adding another services
+    * For `API` use `tasks/create/download_services/` instead of `tasks/create/vtdl/`. Example of data: `data={"hashes":"hash1,hash2"}`
+
+### [28.02.2025]
+* Monitor updates:
+    * NtCreateSection hook: add file path (from handle) to logging (thanks @scccccccccc)
+    * NtCreateSection LdrpCallInitRoutine hook: add coverage-module breakpoint setting, fix 64-bit address logging
+    * Trace: improve logging of conditional jump target addresses, on by default)
+
+### [27.02.2025]
+* Monitor update: Improve handling of bogus VirtualSize values in PE section table during dumping (e.g. e4f4afa1b85113656d4788a4f48fa5263b31b922d3e345093e082486193b0275)
+
+### [26.02.2025]
+* Monitor updates:
+    * Fix import reconstruction entrypoint setting - thanks @shuiyc
+    * Add hooks for MsiInstallProductA/W - thanks @KillerInstinct
+    * Add protected-pids config option (protected-pids=0 to disable, on by default)
+
+### [11.02.2025]
+* `selfextract.conf` renamed to `integrations.conf`.
+    * Please rename your config file.
+
+### [10.02.2025]
+* We are now on `Poetry v2`. If you see next message, you need to upgrade your `poetry` version.
+    * This one might be tricky as depends if your `poetry` was installed with `apt` or script. But something like this should works:
+        * `curl -sSL https://install.python-poetry.org | POETRY_HOME=/etc/poetry python3 -`
+```
+The Poetry configuration is invalid:
+  - Additional properties are not allowed ('requires-poetry' was unexpected)
+```
+* If you see missed `crispy_bootstrap4`. Just run `poetry install` as `cape` user.
+
+### [05.02.2025]
+* Monitor update: Fix hooking deadlock with delay-loaded dlls & make LdrpCallInitRoutine hook transparent
+
+### [28.01.2025]
+* Require `poetry>=2.0`.
+
+### [27.01.2025]
+* Monitor update: Fix import reconstruction (advanced submission option)
+
+### [23.01.2025]
+* Monitor update: Fix bug with dumping PE images with abnormally large PE header (e.g. 5ba3d13c57f6b08f34d8ec4f200091b458fdf48141c23ce959d9cda4804a7f5e) (thanks Kevin Ross)
+
+### [07.01.2025]
+* Monitor update: Fix bug with dump limit being tripped by AMSI preventing unpacked capture in e.g. e69ab87e878305285eab44652fa72b0168b53d2c9d95d5e40ae6311a5b6eec7b (thanks @YungBinary)
+
+### [31.12.2024]
+* Monitor updates:
+    * CoGetClassObject hook: add inspect_clsid for improved injection (e.g. 38a9847cb5ce4918bdfee2d54d5d3b79e1399cce15c7b68d86e8f0a5f48e3131)
+    * SetFileInformationByHandle hook
+    * GetComputerNameExW hook: add fake results for all NameTypes (e.g. 8056b8ff55c452cc87e35d69928cccbcfc5af848db1abb4fe0364510986e068b)
+    * RmStartSession hook (thanks para0x0dise)
+    * LdrpCallInitRoutine hook for Win10+
+
+### [01.11.2024] Parsers
+* Malware config parsers aka parsers are moved out of core of CAPE.
+    * Now they are at their own [repository](https://github.com/CAPESandbox/CAPE-parsers).
+        * Feature added. `load=X`, where `X` is one of those: all/core/community
+            * All = core and community
+        * Exclude parsers. Allows to not load some particular parsers. `exclude_parsers=["name1", "name2"]`
+    * Your custom parsers from `custom/parsers/` will still load and overwrite cape carser if name matches.
+* __Action required!__ `cd /opt/CAPEv2 && poetry install`
+
+### [04.10.2024]
+* Monitor update: Add GetClassObject hook to handle UAC bypass technique using CMSTPLUA COM object
+* PrivateLoader direct syscall capture
+
+### [01.10.2024]
+* Monitor update: Improve fix for size bug with unpacking embedded PEs
+
+### [26.09.2024] Browser monitoring
+* [Browser extension details](https://github.com/kevoreilly/CAPEv2/tree/master/extra/browser_extension/README.md). For code details see [PR](https://github.com/kevoreilly/CAPEv2/pull/2330)
+
+### [23.09.2024]
+* Monitor update: Fix size bug with unpacking embedded PEs
+* .NET loader 'SlowLoader' detonation shim for slower cpus (race condition)
+
+### [18.09.2024]
+* Monitor updates:
+    * Add disassembled instruction to exception output
+    * VBScript hook improvements (thanks Jeremy at Proofpoint)
+
+### [13.09.2024]
+* Fix issue with sign extension causing 32-bit values to be misrepresented in web ui (e.g. 0xffffffffc000005 for 0xc000005)
+* bytes2str(): if any values in dict type are already str then keep them
+* Expand behavior log process information with image base, image size and bitness
+
+### [10.09.2024]
+* Monitor update: Add capability to dynamically unhook previously hooked functions (unhook-apis option takes colon-separated list e.g. unhook-apis=NtSetInformationThread:NtDelayExecution)
+* Themida detonation shim
+
+### [03.09.2024]
+* Monitor updates:
+    * Add HtaFile to CLSIDS handled in WMI/DCOM (e.g. FormBook) - thanks Will Metcalf
+    * VBScript hooks
+
+### [16.08.2024]
+* TTD integration (Microsoft Time Travel Debugging)
+    * Use submission option ttd=1
+    * Place TTD binaries in analyzer/windows/bin (with wow64 subdirectory for 32-bit)
+    * .trc files output to TTD directory in results folder for manual retrieval
+* Monitor update: Small debugger fix
+
+### [07.08.2024]
+* Monitor update: Set language via lang=X (language code) submission option
+
+### [05.08.2024]
+* SparkRAT config parser - thanks t-mtsmt
+
+### [22.07.2024]
+* Monitor update: Enhancements to software (& syscall) breakpoint mechanism, add handling for Internet Shortcut CLSID (.url)
+
+### [11.07.2024]
+* Monitor updates:
+    * (in)direct syscall handling enhancements
+    * unpacking & scanning: improved entropy checks
+
+### [26.06.2024]
+* Monitor updates: debugger/trace enhancements
+
+### [21.06.2024]
+* Monitor updates: misc enhancements & fixes (see capemon repo for details)
+
+### [12.06.2024]
+* Monitor update: Unpacker enhancement: capture modified mapped images
+
+### [10.06.2024]
+* Monitor update: Fix for 64-bit Firefox
+
+### [04.06.2024]
+* Monitor update: New hooks (GetAddrInfoExW, CLSIDFromProgIDEx), 64-bit hooking fixes
+
+### [23.05.2024]
+* Integration of [rat_king_parser](https://github.com/jeFF0Falltrades/rat_king_parser) by @jeFF0Falltrades
+    * Requires `dnfile` upgrade. We can't update it in `pyporject` due to `flare-capa`.
+        * Upgrade `dnfile` by yourself by running: `poetry run pip3 install -U dnfile`
+
+### [22.05.2024]
+* Monitor update: Enhance DnsQuery* hooks to capture DNS server lists (e.g. Socks5Systemz)
+* Socks5Systemz detection & config extraction
+
+### [21.05.2024]
+* Monitor update: Hook full set of service APIs in sechost.dll
+
+### [20.05.2024]
+* YARA-X support - https://virustotal.github.io/yara-x/
+* Monitor update: Debugger fixes/improvements, misc other fixes (see capemon repo for details)
+
+### [11.04.2024]
+* Monitor updates:
+    * YARA upgrade to 4.5.0 (& disabled assertion dialogs)
+    * Enable 64-bit 'native' hooks to avoid SSN overwriting
+    * Expand YARA options to allow offsets relative to the end of a pattern to be specified using asterisk (e.g. bp0=$code*+6)
+
+### [25.03.2024]
+* Bypass for variant of Heaven's Gate direct syscall seen in ecrime loader
+* Monitor updates: misc fixes (see capemon repo for details)
+
+### [20.03.2024]
+* Formbook: ntdll remap bypass & config extraction updates
+* Monitor update: Trace GetRegister() tweak
+
+### [15.03.2024]
+* Monitor update: Further unpacker refinement: Improve filter for unwanted .NET payloads to avoid missing interesting payloads
+
+### [14.03.2024]
+* Monitor update: Unpacker refinement for e.g. Shikata Ga Nai - thanks @para0x0dise
+
+### [12.03.2024]
+* Monitor update: Initial IPv6 support - thanks @cccs-mog
+* Linux support details can be seen in this [Pull Request](https://github.com/kevoreilly/CAPEv2/pull/2001)
+* We remove all `x.conf` to finish the mess with the configs.
+    * DO NOT EDIT `.conf.default` files. cape2.sh makes a copy of them removing `.default`.
+    * If you don't use `cape2.sh`.
+        * Run: `for filename in conf/default/*.conf.default; do cp -vf "./$filename" "./$(echo "$filename" | sed -e 's/.default//g' | sed -e 's/default//g')";  done`
+
+### [07.03.2024]
+* Monitor updates:
+    * Countermeasure for NtCreateUserProcess block-non-Microsoft-DLLs mitigation policy affecting monitoring
+    * Expand 'syscall' breakpoints to handle indirect syscalls (sysbpmode=1)
+    * Small fixes & improvements
+* Pikabot detection update & anti-hook bypass
+
+### [29.02.2024]
+* TLP fields added to distributed database. Requires db upgrade: `cd utils/db_migration_db && alembic upgrade head`
+* Monitor fixes
+
+### [28.02.2024]
+* Add 'ShellWindows' COM object injection mechanism (e.g. Latrodectus MSIs)
+* Monitor: add option to disable ntdll remap protection: ntdll-remap=0
+* Lumma direct systenter unmap crash bypass
+
+### [26.02.2024]
+* Monitor updates: Service injection delay for e.g. msi detonation & EnumDisplayDevices hooks & anti-vm (thanks @enzo)
+* Updated DarkGate config & payload extraction (thanks @enzo)
+* Latrodectus auto-export selection
+
+### [23.02.2024]
+* Monitor updates: Debugger/Trace enhancements
+
+### [14.02.2024]
+* Monitor update: Protect NtFreeVirtualMemory hook against spurious pointer values (e.g. f4bb0089dcf3629b1570fda839ef2f06c29cbf846c5134755d22d419015c8bd2)
+
+### [08.02.2024] CAPA 7 + CAPE
+* [CAPA](https://github.com/mandiant/capa) allows to generate a summary of CAPE's analysis. This gives quick abstract summary of analysis. More details [CAPA v7 blogpost](https://www.mandiant.com/resources/blog/dynamic-capa-executable-behavior-cape-sandbox)
+* Monitor update: Fix logging bug causing rare buffer overflows (e.g. 780be7a70ce3567ef268f6c768fc5a3d2510310c603bf481ebffd65e4fe95ff3)
+
+### [05.02.2024]
+* PhemedroneStealer config extractor - thanks @tccontre18 - Br3akp0int
+
+### [31.01.2024]
+* Monitor update: Protect 64-bit hooks against unaligned stack (e.g. 780be7a70ce3567ef268f6c768fc5a3d2510310c603bf481ebffd65e4fe95ff3)
+
+### [24.01.2024]
+* Monitor update: Improve handling of irregularly mapped PE images (e.g. from 7911e39e07995e3afb97ac0e5a4608c10c2e278bef29924ecc3924edfcc495ca)
+
+### [23.01.2024]
+* Monitor updates:
+    * PE dumping refinements for small PEs
+    * Debugger: don't trace rundll32 entry point for dlls submitted with bpX=ep
+
+### [18.01.2024]
+* Monitor update: Harden against volatile register anti-hook technique in e.g. AgentTesla (thanks @ClaudioWayne)
+
+### [10.01.2024]
+* Monitor updates:
+    * Further process dump filter hardening
+    * Fix dotnet cache dumps
+
+### [05.01.2024]
+* Monitor updates: fix a couple of issues affecting detonation (see capemon repo for details)
+
+### [08.12.2023]
+* Monitor updates:
+    * Expand procdump config option to allow forced procdumps irrespective of code section changes (procdump=2)
+    * Improve dumping of images with missing section addresses (e.g. VMP)
+
+### [07.12.2023]
+* Monitor update: fix bug in dumping malformed PEs
+
+### [05.12.2023]
+* Monitor updates:
+    * Process dump filter enhancements & fix
+    * Enhanced checks (parent process path) for service hookset assignment
+    * Misc fixes
+
+### [04.12.2023] IPinfo.io database integration
+* Introduce support for IPinfo.io database. You can download database [here](https://ipinfo.io/account/data-downloads).
+* To enable it:
+    * `conf/processing.conf` -> `network` -> `country_lookup = yes` and point `maxmind_database` to proper file.
+
+### [30.11.2023]
+* Monitor update: Fix bug affecting some process dumps
+
+### [29.11.2023] Unify download services
+* Virustotal config moved from `auxiliary.conf` to `web.conf` under `download_services`
+
+### [24.11.2023]
+* AsyncRAT config parser overhaul
+* Monitor update: Debugger tweaks
+
+### [17.11.2023]
+* Monitor update: Debugger fixes & enhancements (action target registers can be pointers when within [], e.g. action2=string:[esp])
+
+### [14.11.2023]
+* Monitor update: Small detonation fix
+* Formbook detonation & config tweaks
+
+### [7.11.2023]
+* Monitor updates: Misc debugger tweaks
+* XWorm config extraction
+
+### [3.11.2023]
+* Monitor updates:
+    * New debugger actions: 'setsrc' & 'setdst' to set values pointed at by instruction operands
+    * Improve filtering of uninteresting process dumps
+    * Misc fixes/improvements
+
+### [1.11.2023] ZPAQ Support
+* __ACTION REQUIRED__
+    * `sudo apt install zpaq`
+    * as cape user: `poetry install`
+
+### [20.10.2023]
+* Monitor fixes: address new issue affecting procdump and add check in compileMethod hook
+
+### [19.10.2023]
+* Monitor update:
+    * Unpacker: reduce/filter unwanted .NET payloads
+
+### [13.10.2023]
+* Formbook updates
+* Monitor updates:
+    * NtContinueEx hook
+    * Debugger action enhancements: setptr, patch, sleep, exit
+    * Software breakpoint handler enhancement
+    * Misc fixes/improvements
+
+### [11.10.2023]
+* Formbook config extraction
+* Monitor updates:
+    * GetComputerNameExW hook added, PostThreadMessage hook enhancement
+    * Debugger action enhancements
+    * Misc fixes
+
+### Download files matched by YARA
+* When doing search by `capeyara` we expose button to download files that only matches that search criteria.
+    * For [@fumik0_](https://twitter.com/fumik0_) with love.
+
+### [22.9.2023] CSRF changes
+* __IMPORTANT__. If you using __https__ please update config to use new field for __CSRF__ in `conf/web.conf`.
+    * Before: `[general]` -> `hostname`.
+    * Now: `[security]` -> `csrf_trusted_origins`
+
+### [19.9.2023]
+* Storage of file data in MongoDB
+    * Store the parts of a report's file data that is independent of a detonation in a separate collection
+      to conserve disk space.
+* __ACTION REQUIRED__
+    * It is recommended to add a regular cron job to call `cd /opt/CAPEv2 && sudo -u cape poetry run python ./utils/cleaners.py --delete-unused-file-data-in-mongo`
+      to prune these entries that are no longer needed.
+
+### [13.9.2023]
+* Monitor updates:
+    * .NET JIT native cache handling improvements
+    * New debugger action 'string' to capture decrypted strings
+    * Fix issue in procname_watch_init() with non-null-terminated unicode paths - thanks Proofpoint for the report
+
+### [8.9.2023]
+* Monitor update:
+    * .NET JIT native cache scanning & dumping
+
+### [1.9.2023]
+* Monitor updates:
+    * Fix missing browser hooks config setting for Edge & Chrome
+    * Trace: add config option to try and skip loops which flood trace logs (loopskip=1)
+
+### [25.8.2023]
+* Monitor update: Upgrade monitor Yara to 4.3.2 (thanks Michael Weiser)
+
+### [19.8.2023]
+* Monitor update: fix memcpy hook logging issue
+
+### [16.8.2023]
+* Monitor updates:
+    * Filter uninteresting process dumps via new VerifyCodeSection() function checking code section for modification
+    * Fix issue with process path-based options being set too late (after yara init)
+    * YaraScan: do not call SetInitialBreakpoints() unless DebuggerInitialised flag is set
+
+### [10.8.2023]
+* Monitor updates:
+    * Fix for NtQueueApcThread hook: do not send thread handle in 'process' message
+    * Add WmiPrvSE.exe to services hookset to fix Win10 WMI/interop detonation issues
+
+### [8.8.2023]
+* Minimal YARA version now is 4.3.1
+* `file_extra_info` modules autoload, see example in `lib/cuckoo/common/file_extra_info_modules`
+* Initial compatibility with x64 python version in guests.
+* In `agent.py` add `is_admin` value.
+
+### [5.8.2023]
+* New anti-direct-syscall feature: 'syscall breakpoints' (64-bit only)
+    * redirect syscalls back through traditional hooks
+    * via monitor yara & updated monitor
+* Monitor updates:
+    * Unpacker: add dumping of decrypted PEs from CryptDecrypt(), NCryptDecrypt(), BCryptDecrypt()
+    * NtOpenProcessToken, NtQueryInformationToken, RtlWow64GetThreadContext hooks
+    * Syscall breakpoint implementation (64-bit)
+    * Fix hook issues with NtQueueApcThread, GetWriteWatch
+    * Misc fixes & improvements (see capemon repo for details)
+
+### [31.7.2023] Prescan feature
+* Allows to scan all new file tasks with YARA. Must be enabled in `web.conf` -> `[general]` -> `yara_recon`.
+    * This allows you to set CAPE arguments, as tags for example for proper VM pickup.
+    * YARA name must ends with `Crypter`, `Packer`, `Obfuscator` or `Loader` and have `cape_name` and `cape_options` in meta. Example:
+    * See `def recon` in `CAPEv2/lib/cuckoo/common/web_utils.py`
+```
+rule X_cryptor {
+    meta:
+        author = "doomedraven"
+        description = "New X Crypter"
+        cape_type = "New X Crypter"
+        cape_options = "tags=win10"
+    strings:
+        $a = "New awesome crypter <3" fullword
+    condition:
+        $a
+}
+```
+
+### [28.7.2023]
+* Syscall hooks now enabled by default
+* Monitor updates:
+    * improved syscall hook logging, unpacker & debugger integration
+    * new debugger actions "call" & "setbpX"
+    * misc improvements
+
+### [18.7.2023]
+* FLARE CAPA v6 support. Is now uniq supported version. They doing breaking changes.
+
+### [14.7.2023]
+* Monitor update: Add hook for LoadLibraryExW
+
+### [7.7.2023]
+* UPX-type dynamic unpacker in yara sig
+* Monitor updates:
+    * New debugger action 'Step2OEP' for packers like UPX
+    * Deprecate obsolete UPX unpacker code
+    * misc improvements & fixes
+
+### [24.6.2023] EuskalHack feature
+* .inf detonation. Requires `sflock2==0.3.50`
+* New admin/admin.py - Cluster edition - [Documentation](https://capev2.readthedocs.io/en/latest/usage/cluster_administration.html)
+* New dependency. Run `cd /opt/CAPEv2 && poetry install`
+*
+### [19.6.2023]
+* Monitor update: misc improvements & fixes
+
+### [13.6.2023]
+* Monitor update: fix issue with Microsoft Edge not launching properly (#1587)
+
+### [5.6.2023]
+* Stealc detection update
+* Monitor update: Fix NtWriteFile hook issue by removing critical sections - thanks to @RazviOverflow for report
+
+### [30.5.2023]
+* Monitor updates:
+    * Add GetWriteWatch & UpdateProcThreadAttribute hooks which allow Pikabot detonation - thanks @enzok!
+    * CoCreateInstance(Ex) hook improvements - thanks @heck-gd!
+    * PostThreadMessage hooks - thanks @nblog!
+* PikaBot detection update
+
+### [29.5.2023]
+* URL default analysis package selection in web.conf
+* SQLAlchemy2 migration started
+* MSIX extract
+
+### [21.4.2023]
+* Fix issue with Rhadamanthys & BumbleBeeLoader FPs due to monitor sigs in process dumps
+* Monitor update: Debugger hardening & new actions
+
+### [21.4.2023]
+* Monitor updates: Misc fixes (see capemon repo) & hooks for CreateProcessA/W to reduce noise
+
+### [6.4.2023]
+* Monitor update: Add hook for WinExec()
+
+### [5.4.2023] Configs make easier
+* Simplifing the configuration
+    * Do NOT edit any config that ends on `.default` as it will be default config.
+    * For more details read readme inside of `conf` folder.
+
+### [30.3.2023]
+* RedLine config extraction - thanks @Gi7w0rm
+* Monitor fixes:
+    * Harden GetExportAddress() against malformed PE images
+    * Add fallback payload metadata in ProcessTrackedRegions
+
+### [21.3.2023] Syscall Hooks
+* New feature (beta):
+    * Syscall hooks on Win10+ (via InstrumentationCallback) via submission checkbox or option: syscall=1
+* Ursnif/ISFB detection & config extraction update
+
+### [17.3.2023]
+* Monitor fixes:
+    * Unpacker: Improve ProcessTrackedRegion() to allow yara scans of mapped modules
+    * Disable sleep skips prior to thread creation (rather than after) and upon CoCreateInstance (WMI etc)
+
+### [16.3.2023] Loggers
+* New config `conf/logging.conf`. Remember to copy it to `custom/conf/logging.conf` for moddifications.
+    * Syslog handler for `cuckoo.py` and `process.py` can be on/off in config. Useful for global monitoring tools or cloud setups.
+    * Allow to create logs per analysis in analysis folder. Useful for distributed setup to show on webgui if enabled and have logs in main server.
+
+### [10.3.2023]
+* Monitor fixes:
+    * Prevent unpacker initialisation from adding imagebase to tracked regions, allow yara scans on caller
+    * CoGetClassObject hook: remove modification of dwClsContext parameter causing detonation failures
+
+### [9.3.2023]
+* Monitor updates:
+    * Remove cryptsp 'double' hooks in Office processes due to detonation failures (e.g. Word 2016)
+    * Prevent following child processes of WerSvc (to prevent werfault.exe producing mini dumps that are detected by yara due to in-memory monitor sigs)
+
+### [8.3.2023]
+* Virtual machine tags: For Windows only. Please set windows version in tag, any of: winxp, win7, win8, win10, win11.
+    * This is required for proper detonation for packages like MsiX.
+* New feature. In `web.conf` there is section `[packages]`:
+    * It allows to create new packages and push them to correct VMs.
+    * Or in case you want to detonate some of the packages only on specific VMs you can specify it there like: `package:vm_tag1,vm_tagX`
+* MsiX file proper recognization requires upgrade to `sflock2==0.3.48`, otherwise it will push it as zip or extract and add each file as separated job.
+
+### [1.03.2023]
+* Msix/MsixBundle package works only on Windows >= 10
+* Quarantine is integrated into normal file submission so you don't need to know if file is normal or quarantined.
+
+### [24.2.2023] CAPE 2.4: 🌻 Edition
+* New Unpacker option: `unpacker=2`
+* Deprecated:
+    * submitCAPE.py - no more additional jobs
+* Staging branch:
+    * We want to have CAPE stable. So new features will go to staging branch for 1-2 weeks before merged to master.
+    * If you want to help us to spot any possible issue use that branch on your dev side.
+* We need help to add as much tests as possible to cover all possible cases to prevent broken code.
+* Stop using `conf/` folder. All config should be in `custom/conf/`. This will simplify your life on CAPE updates when new entry added to base templates. [Details](https://github.com/kevoreilly/CAPEv2/blob/master/conf/readme.md)
+
+### [20.2.2023]
+* Scheduler update:
+    * A machine may be configured with `reserved = yes` in `<machinery>.conf`. For such machines, the scheduler will
+      not use it for tasks unless the user specifically requests it by its label.
+* Database update:
+    * The 'name' of all machines defined in `<machinery>.conf` must be unique. The same goes for their 'label' fields.
+
+### [16.2.2023]
+* Monitor update: Hooking engine stability fix for detonation issues (e.g. Word)
+
+### [4.2.2023]
+* Monitor updates:
+    * Extend svchost hookset to Winmgmt (netsvcs) service
+    * Fix for bug in get_full_keyvalue_pathUS() (thanks oalieno)
+
+### [2.2.2023]
+* Monitor update: Process dump improvements & 'export' option to allow DLL export to be defined by monitor yara signature
+
+### [1.2.2023]
+* Monitor update: Disable spawning WER processes (werfault.exe etc) via RtlReportSilentProcessExit hook
+
+### [30.01.2023]
+* Add `utils/fstab.py` utils which is used by `utils/dist.py` when NFS mode is used.
+    * Check configure NFS in [documentation](https://capev2.readthedocs.io/en/latest/usage/dist.html):
+* Now when you register new server in distributed cluster that uses NFS, it will automatically:
+    * Create worker folder
+    * Add NFS entry to `/etc/fstab`. Ex:
+        * `192.168.1.1:/opt/CAPEv2 /opt/CAPEv2/workers/192.168.1.1 nfs, auto,user,users,nofail,noatime,nolock,intr,tcp,actimeo=1800, 0 0`
+    * Mount folder
+
+### [26.1.2023] Configs
+* Please read [this](https://github.com/kevoreilly/CAPEv2/blob/master/conf/readme.md) to simplify your life with configs managment
+
+### [25.1.2023]
+* Google Cloud Platform (GCP) support in distributed CAPE aka dist.py
+
+### [5.1.2023]
+* Big duplicated code cleanup. Context: CAPE.py module processing all the files so it calling File(x).get_all() which is pretty heavy.
+* Deprecated standalone modules. They are moved inside of CAPE.py. Data will be under the same keys.
+    * Target info
+    * Dropped
+    * ProcDump
+* Url analysis moved to `nodules/processing/url_analysis.py`
+
+### [4.1.2023]
+* Monitor update: Fix 32-bit stack recursion hook issue (affecting, for example, golang binaries)
+
+### [28.12.2022] NETReactorSlayer
+* Integrated deobfuscator and unpacker for Eziriz .NET Reactor. [Source](https://github.com/SychicBoy/NETReactorSlayer).
+    * You need to download version for your CPU and extract it to `data/NETReactorSlayer.CLI`
+        * In case if you are on x64 host, then just run: `poetry run python utils/community.py -waf`
+    * Add execution permission with `chmod a+x data/NETReactorSlayer.CLI`
+* Now each section inside of `integrations.conf` has timeout value. Default is 60 seconds
+
+### [24.12.2022]
+* Monitor updates: Fix NtAllocateVirtualMemoryEx & NtMapViewOfSectionEx hooks and rebuild with Visual Studio 2022
+
+### [2.12.2022]
+* Monitor updates: add 32-bit hook compatibility to allow hooking of GetCommandLine APIs (and add GetCommandLineA hook)
+
+### [17.11.2022]
+* QakBot config extraction update
+* Emotet detection & config extractor updates
+
+### [10.11.2022]
+* Monitor fixes:
+    * Fixes for CreateTimerQueueTimer hook affecting Emotet detonation
+    * Remove function name resolving via ScyllaGetExportNameByAddress() in thread & process hooks due to issues
+
+### [14.11.2022]
+* Monitor fixes:
+    * hook recursion issue in 64-bit monitor
+    * UNICODE_STRING comparison issue in add_all_dlls_to_dll_ranges()
+
+### [7.11.2022]
+* Monitor updates: misc fixes & improvements (see capemon repo for details)
+* Fix merging of split configs per family in CAPE processing module
+
+### [11.10.2022] Archive package
+* [archive package](https://github.com/kevoreilly/CAPEv2/blob/master/analyzer/windows/modules/packages/archive.py) by [@cccs-kevin](https://github.com/cccs-kevin) with a nice talk explaining how to detonate some kind of malware properly [here](https://youtu.be/-70Mlkmtdds?t=13013). Thank you Kevin and CCCS team for this contribution. [Documentation](https://capev2.readthedocs.io/en/latest/usage/packages.html).
+
+### [6.10.2022]
+* Some not core dependencies are commented out and won't be installed anympore by default.
+* Our idea is to leave CAPE core with core dependencies to avoid conflicts with another libraries.
+
+### [1-10-2022]
+* Monitor update: GetSystemInfo anti-vm improvement & 64-bit hooking engine fix
+
+### [24-9-2022]
+* Monitor update: Per-api total cap (api-cap=X) and Javascript (wscript) hookset
+
+### [17-9-2022]
+* Monitor update: misc fixes (see capemon repo for details)
+
+### [12-9-2022]
+* Monitor update: TLSdump on Win10 & other improvements (see capemon repo for details)
+
+### [2-9-2022]
+* Monitor update: Fix issue with incorrect prototype for NtCreateThreadEx hook
+
+### [28-08-2022] [Maco - Malware config extractor framework](https://github.com/CybercentreCanada/Maco)
+* [MACO foramt for malware configs](https://github.com/kevoreilly/CAPEv2/pull/1037)
+
+### [26-08-2022]
+* [Interactive mode](https://github.com/kevoreilly/CAPEv2/pull/1065) thanks to @enzok based on his [guac-session](https://github.com/enzok/guac-session/). [Docs](https://capev2.readthedocs.io/en/latest/usage/interactive_desktop.html)
+
+### [18-8-2022]
+* Function `yara_detected` now returns 4 arguments. 4th is file metadata
+
+### [17-8-2022]
+* Monitor updates:
+    * Enable enhanced .NET dumps
+    * Misc updates & fixes (see capemon repo)
+
+### [30-7-2022]
+* [Details here](https://github.com/kevoreilly/CAPEv2/pull/1020)
+* __ACTION REQUIRED__
+    * `cd /opt/CAPEv2/utils/db_migration && alembic upgrade head`
+    * Restart:
+        * CAPE service `systemctl restart cape cape-processor`
+        * Web: uwsgi or cape-web
+
+### [15-7-2022]
+* Monitor updates:
+    * MSI detonation (Win10)
+    * Misc updates & fixes (see capemon repo)
+
+### [11-7-2022]
+* FLARE-CAPA fix, you must install it from `GitHub`. Pip version is different.
+* FLOSS 2.0 integration.
+* BinGraph requires CAPE's version: `poetry run pip install git+https://github.com/CAPESandbox/binGraph`
+* `on_demand` fixed.
+* __ACTION REQUIRED__
+    * Now that CAPA and Floss uses the same signatures we renamed `capa-signatures` to `flare-signatures`
+    * `python3 utils/community.py -cr`
+
+### [15-6-2022]
+* [Azure machinery](https://github.com/kevoreilly/CAPEv2/pull/922) by @cccs-kevin
+
+### [8-6-2022]
+* Use poetry to handle dependencies
+    * requirements.txt is still present to continue support for pip
+* Added pre-commit hooks
+* Add community blocklist to avoid pulling some undesired modules/signatures/etc.
+
+### [10-5-2022]
+* Added AWS machinery and ReversingLabs file lookup by @JaminB
+
+### [5-5-2022]
+* Monitor updates:
+    * Increase GlobalMemoryStatusEx faked return value
+    * Loosen requirements in TestPERequirements to allow zero-sized sections
+    * Fix issue with missing dropped files (e.g. 64-bit Al-khaser log.txt)
+    * Crypto hooks: add buffer length to logs, add dump-crypto to NCrypt APIs & use DumpMemoryRaw()
+    * Trace improvements (64-bit set register range and DoStepOver function)
+    * Debugger improvements (NoSetThreadContext for Win 10 breakpoints)
+    * Fix off-by-one in ReverseScanForNonZero()
+
+### [3-5-2022]
+*  lnkparse3 integration
+
+### [20-4-2022]
+* Emotet E5 update
+* Monitor updates:
+    * New hooks: LdrGetProcedureAddressForCaller, GetCommandLineW
+    * Fix issue with payload metadata incorrectly set in certain conditions
+
+### [19-4-2022]
+* Emotet E4 update (new 64-bit)
+
+### [1-4-2022]
+* Monitor update: Fix issue with attempted dll load notifications in tlsdump mode causing lsass to crash
+
+### [31-3-2022]
+* Monitor updates:
+    * dump-crypto option: add dumping of Bcrypt encrypt/decrypt apis
+    * Add general typestring to options, overrides type codes
+
+### [28-3-2022]
+* Monitor: Fix issue causing some exceptions in VirtualProtectEx and NtProtectVirtualMemory hooks
+* Unittests for core enabled on GitHub. Please help us cover as much as we can to make CAPE more stable than never.
+
+### [16-3-2022]
+* Monitor updates:
+    * Add 'Unwind' debugger action for x86
+    * Fix for NtCreateThreadEx hook not initialising thread breakpoints
+    * Filter dlls alongside target process executable in add_all_dlls_to_dll_ranges()
+    * Fix issues with WriteMemoryHandler invocation in hooks, update NtWow64 function prototypes
+    * Show dll load notifications in behavior log, use already_hooked() on load check
+    * Add module name to debugger log exception output
+    * Do RestoreHeaders() at end of init
+    * Add Yara logging switch
+
+### [4-3-2022]
+* Rewritten detection.
+    * Now if you have many different detections it will show all of them, not only 1. Details about each detection is in CAPE signature
+    * This is not backward compatible feature, so search won't return old matches
+
+### [2-3-2022]
+* Emotet updates
+
+### [23-2-2022]
+* Loader update: fix check for previous IAT patch with corrected size (fixes #748 - Obsidium packers)
+* PlugX updates
+* Emotet updates
+
+### [20-02-2022] [UnAutoIt](https://github.com/x0r19x91/UnAutoIt) by @x0r19x91
+* You need to compile it by yourself and put binary under `/opt/CAPEv2/data/UnAutoIt`
+```
+cd /opt/CAPEv2/data/
+snap install go --classic
+git clone https://github.com/x0r19x91/UnAutoIt && cd UnAutoIt
+GOOS="linux" GOARCH="amd64" go build -o UnAutoIt
+```
+
+### [19-02-2022] [Detect It Easy](https://github.com/horsicq/Detect-It-Easy/) by @horsicq
+* To install it you can download installer from [here](https://github.com/horsicq/DIE-engine/releases)
+```
+sudo apt install libqt5opengl5 libqt5script5 libqt5scripttools5 -y
+wget "https://github.com/horsicq/DIE-engine/releases/download/${DIE_VERSION}/die_${DIE_VERSION}_Ubuntu_${UBUNTU_VERSION}_amd64.deb" -O DIE.deb
+sudo dpkg -i DIE.deb
+```
+
+### [18-02-2022] Depricate static
+* To be able to generate the same info as was generated for initial binary under static tab. We decided to depricate static module and make it reusable for any other files like dropped, downloaded, etc.
+* So now you will be able all file static info on each file to speedup your analysis
+
+### [15-2-2022]
+* Monitor updates:
+    * Do not call notify_successful_load() if tlsdump mode (avoid lsass being added to analyzer process list)
+    * Fix: ensure module (ntdll) is writeable before calling restore_hooks_on_range()
+
+### [13-02-2022] PEEPDF
+* [peepdf](https://github.com/CAPESandbox/peepdf) isn't installed anymore by default, python3 version is pretty buggy, so if you want to fix it you are more than welcome!
+
+### [7-2-2022]
+* Monitor updates:
+    * Add hooks for NtAllocateVirtualMemoryEx, NtMapViewOfSectionEx, NtUnmapViewOfSectionEx (Win10+)
+    * Extend ntdll protection to cover VirtualProtectEx, make more stealthy
+
+### [5-02-2022] Config extractors
+* Make standard file key for all `path` keys. No more: `file`, `path`, etc. Now just `x["path"]`
+* MWCP, malwareconfigs, and malduck are not part of requirements.txt anymore! They bring their own dependencies that not everyone needs. If you enable that framework in processing.conf you need to install that dependencies.
+    * TIP: You need to figurate the proper version(is another reason why we abondone them)
+        * `poetry run pip install git+https://github.com/Defense-Cyber-Crime-Center/DC3-MWCP`
+        * `poetry run pip install git+https://github.com/kevthehermit/RATDecoders`
+        * `poetry run pip install git+https://github.com/CERT-Polska/malduck/`
+* `PyCrypto` replaced with [PyCryptoDoMeX](https://pycryptodome.readthedocs.io/en/latest/src/installation.html)
+* __ACTION REQUIRED__
+    * `poetry run pip install pycryptodomex==3.14.0`
+    * Restart:
+        * CAPE service `systemctl restart cape-processor`
+
+### [4-2-2022]
+* Monitor updates:
+    * Dump-on-API bug fix
+    * YaraHarness: fix issue with delta variable
+    * End yara later during shutdown
+    * Prevent unloading core modules (fix #531)
+    * New crypto hooks: CryptDeriveKey, CryptDestroyKey, CryptDestroyHash
+    * YaraInit: log number of loaded sigs rather than a list
+    * Debugger push & pop actions
+    * WriteMemoryHandler: tiny code clean
+    * CreateProcessHandler: improve logging
+    * Fix evasion techniques reported by (& many thanks to) Alexey Bukhteyev of Checkpoint, [writeup](https://research.checkpoint.com/2022/invisible-cuckoo-cape-sandbox-evasion/)
+* Update 'GetTickCount' anti-vm bypass with latest IcedID packers
+
+### [26-1-2022]
+* Config extension, for short details see [PR](https://github.com/kevoreilly/CAPEv2/pull/724) or full [read docs](https://capev2.readthedocs.io/en/latest/installation/host/configuration.html)
+
+### [20-1-2022]
+* MongoDB abstraction for easier upgrades when they depricate some apis + code cleanup
+
+### [19-1-2022]
+* Monitor: PE dumping more tolerant of inaccessible sections (e.g. recent Emotet)
+* Updates for latest Emotet Epoch 4
+
+### [8-1-2022]
+* Feature: AMSI dumps (enabled by default for Win10+)
+
+### [17-12-2021]
+* Monitor: x64 debugger updates & improvements
+* Al-khaser bypass
+* ElasticSearch to store reports support by @CorraMatte
+
+### [22-12-2021]
+* Add new field to DB `arch`. To avoid problems with pendings tasks when user didn't read config and set tags
+* If you using `dist.py` ensure next:
+    * If you have `x64` and `x86` VMs:
+        * `x64` VMs should have both `x64` and `x86` tags. Otherwise only `x64` tag
+    * `x86` VMs should have only `x86` tag.
+    * You can use any other tags, just to work properly you need those two.
+    * Tags requires update in `machine` table in distributed database if your server contains only x64 VMs.
+    * Probably will be improved in future for better solution
+* __ACTION REQUIRED__
+    * `cd /opt/CAPEv2/utils/db_migration && alembic upgrade head`
+    * Restart:
+        * CAPE service `systemctl restart cape`
+        * Web: uwsgi or cape-web
+
+### [14-12-2021]
+* Monitor: Add Add debugger actions: 'nop' and 'wret' to patch instructions with nop and ret
+* Yara dynamic bypass for latest Emotet packer anti-vm trick
+
+### [11-12-2021]
+* Monitor: Add RDTSCP NOP option as alternative for when emulation is too slow (and timestamp counter value not needed)
+* Yara signature to enable RDTSCP NOP dynamically for recent Emotet/ISFB packers
+
+### [07-12-2021] Decode them all
+* VBE/JSE/BATCH decoded and shown on WebGui
+* __ACTION REQUIRED__
+    * `poetry run pip install -U git+https://github.com/DissectMalware/batch_deobfuscator`
+* Monitor: Add support for parent pid in payload capture (thanks to Intezer)
+
+### [02-12-2021] - API changes
+* We spot that pyzipper adds huge overhead specially to distributed cape.
+* Repors now are just zips, screens also now zips, anything that is not contains malicious code is just pure zip, the rest is keeps the same.
+
+### [01-12-2021]
+* Monitor: Bcrypt hooks, disable yara scans in IE, silent rdtscp emulation, other misc tweaks
+
+### [23-11-2021]
+* Integrate [Kixtart-Detokenizer](https://github.com/jhumble/Kixtart-Detokenizer)
+* Simplify integration of another tools to unpack/extract files
+
+### [18-11-2021]
+* Add [RichHeader](https://github.com/RichHeaderResearch/RichPE) MD5
+* Improve Suricata family detection
+* Extract strings on demand feature
+
+### [08-11-2021]
+* Monitor: rdtscp emulation, optional exception & breakpoint logging
+
+### [04-11-2021]
+* Move Office hook options from packages to monitor
+* Monitor: Disable NtWaitForSingleObject hook for 32-bit Windows 8+ due to crashes
+
+### [03-11-2021]
+* Add MongoDB multifield index for all SHA256 fields.
+    * if you using any other fields for frequent lookup, add indexes for that on your side to speedup database
+
+### [01-11-2021]
+* Allow download reports as zip via API
+* Fix python analysis support in Windows
+
+### [22-10-2021]
+* POC: AntiRansomware:
+    * Can be enabled in `processing.conf` it will disable processing of files with extensions that are not in allowed list, see `modules/processing/antiransomware.py`
+    * Specially useful to disable them in CAPE.py that gather all the metadata, yara etc and can consume a lot of ram
+
+### [21-10-2021]
+* Monitor update: Monitor fix for scan crashes in e.g. Equation Editor/Cmd (thanks Will)
+
+### [19-10-2021]
+* Monitor update: Monitor fix for NtSuspendThread hook issue (thanks Intezer)
+
+### CENTS - Configuration Extraction to Network Traffic Signatures
+* For full description [read](https://github.com/kevoreilly/CAPEv2/pull/605)
+
+### [17-10-2021]
+* Monitor update: Win10x64 deadlock fix & other misc fixes (see capemon repo for details)
+
+### [2-10-2021] Hacktoberfest
+* Add test module to extraction framework to ensure that they are loaded properly: CAPE, MWCP, RATDecoders, Malduck
+* Monitor update: Fixes/hardening of dumps (PE & memory) and yara scans (e.g. SquirrelWaffle)
+* Handled errors that was giving problem to use `init_yara` sometime, used in Qakbot extractor
+    * `OSError: /opt/CAPEv2/lib/cuckoo/common/blzpack_lib.so: failed to map segment from shared object`
+* Bingraph:
+    * matplotlib `forward` deprication fixed
+    * moved to external dependency, we host CAPE's version here https://github.com/CAPESandbox/binGraph.
+    * __ACTION REQUIRED__
+        * `poetry run pip install -U git+https://github.com/CAPESandbox/binGraph`
+
+
+### [23-09-2021]
+* Monitor update: Add CLSIDs and IsValidUrl hook for CVE-2021-40444
+
+### [22-09-2021]
+* SquirrelWaffle detection & config extraction
+* Monitor improvements:
+    * Dumping stability improvements (ScanForDisguisedPE, IsDisguisedPEHeader, DumpMemory, DumpRegion)
+    * Add config option to allow enable/disable scans/dumps while loader lock held
+    * Monitor updates: dump/scan stability improvements, configurable loader lock scans/dumps, window hook fixes
+
+### [14-09-2021]
+* Update Lockbit yara sig
+* Update Bazar yara sig
+* We spot that some extractors only works with `mwcp==3.2.1`, requirements updated
+* FLARE-CAPA v3
+
+### [11-09-2021]
+* Monitor improvements:
+    * Restrict debugger breakpoint protection to current process (NtSetContextThread)
+    * Limit "Dropped file limit reached" messages to just one per process
+
+### [02-09-2021]
+* Monitor fixes:
+    * Some dropped files being missed (file_handle_terminate())
+    * Disable ntdll write-protection for Office processes
+
+### [06-09-2021]
+* Sflock update with more PE checks, as in many cases PE has other formats strings inside
+* __ACTION REQUIRED__
+    * `poetry run pip install -U sflock2`
+
+### [02-09-2021]
+* Monitor: Remove case-sensitivity from check for dll path (e.g. Hancitor maldoc-spawned dlls)
+
+### [28-08-2021]
+* Monitor: revert changes to IsPeImageRaw() while crashes (e.g. BazarLoader) are investigated
+
+### [25-08-2021]
+* __ACTION REQUIRED__
+    * `poetry run pip install -U pyattck`
+
+### [19-08-2021]
+* Move office settings from package options to in-monitor (automatic)
+* Fix issue with tlsdump/lsass being assigned 'first process' in analyzer
+* Usage graph moved to under statistics block
+
+### [18-08-2021]
+* Monitor update: stability fixes (window hooks, ...) & debugger improvements
+
+### [11-08-2021]
+* Distributed. Master node stop picking pending tasks when `node=X` is specified and master_storage_only=False
+
+### [10-08-2021]
+* Monitor update: Remove unnecessary check in TestPERequirements causing failed PE dumps
+* Search by hash now will cover any file in CAPE that contains hash.
+    * It searches in binary/Dropped files/CAPE payloads/ProcessDump
+    * payloads: md5 <- as example not needed anymore and will be deprecated in next month
+
+### [08-08-2021]
+* Monitor update: debugger improvements
+* Loader: fix debug output for shellcode start address including offset
+* Allow start offsets into shellcode to be set for Shellcode packages (offset=x)
+
+### [07-08-2021]
+* Monitor update: fix issue causing occasional crashes on x64 when calling ScyllaGetExportDirectory on apphelp.dll
+* XLMMacroDeobfuscator moved to `on_demand`
+
+### [28-07-2021]
+* bzip archives was replaced with zip with password, default infected, can be changes in conf/web.conf -> zipped_download -> zip_pwd
+    * use 7zip or pyzipper to extract
+
+### [23-07-2021] Distribute task based on route
+* Add hability to have different exit nodes on each cape worker in cluster, that will auto pickup proper worker server based on route.
+    * To update current nodes details on main db server, do the request with pull request
+
+### [21-07-2021] [Xll support](https://www.fortinet.com/blog/threat-research/signed-sealed-and-delivered-signed-xll-file-delivers-buer-loader)
+* __ACTION REQUIRED__
+    * `poetry run pip install -U sflock2`
+
+### [07-07-2021] Signature testing
+* Allow to execute one specific signature, loading data from mongo or json report. Specially useful for signature based extractors.
+    * python3 utils/process.py -r ID -sig -sn cape_detected_threat
+
+### [06-07-2021] [Malduck](https://github.com/CERT-Polska/malduck)
+* Integration of part of [mwcfg-modules](https://github.com/c3rb3ru5d3d53c/mwcfg-modules) by [@c3rb3ru5d3d53c](https://github.com/c3rb3ru5d3d53c)
+
+### [05-07-2021]
+* Add support for archives in static extraction, so you don't need to submit them one by one
+
+### [20-06-2021] [enter the sandman](https://www.youtube.com/watch?v=CD-E-LDc384) @doomedraven moved to CAPEv2
+* Expect more fixes :)
+
+### [17-06-2021]
+* Updates to processing module & monitor to allow type strings to replace old type codes
+* Updates to 'dump' Debugger action
+* Hit counts added to debugger breakpoints
+
+### [17-06-2021]
+* add `username` field to be used for custom auth
+* __ACTION REQUIRED__ if you using dist.py
+    * `cd utils/db_migration && alembic upgrade head`
+
+### [13-06-2021]
+* Introdiced checker of available space in process.py to prevent system run out of memory and generate a lot of troubles
+
+### [10-06-2021] dist.py
+* Migrates from ht_user/ht_pass to apikey for proper apiv2 integration
+* __ACTION REQUIRED__ if you using dist.py
+    * `cd utils/db_migration_dist && alembic upgrade head`
+
+### [09-06-2021] RAMFS renamed to TMPFS
+* As TMPFS is better and modernish, and it was a naming typo
+
+```
+# only if you using volatility to speedup IO
+mkdir -p /mnt/tmpfs
+mount -t tmpfs -o size=50g tmpfs /mnt/tmpfs
+chown cape:cape /mnt/tmpfs
+vim /etc/fstab
+tmpfs       /mnt/tmpfs tmpfs   nodev,nosuid,noexec,nodiratime,size=50g   0 0
+```
+
+* [ORJson](https://pypi.org/project/orjson/) library is now used for json report if installed
+    * orjson is a fast JSON library for Python. It benchmarks as the fastest Python library for JSON. Its serialization performance is 2x to 3x the nearest other library and 4.5x to 11.5x the standard library.
+
+### [07-06-2021] MongoDB auth fixed
+* [Example of user/role creation](https://pymongo.readthedocs.io/en/stable/examples/authentication.html)
+```
+use admin
+
+# To Create root user
+use admin
+db.createUser(
+      {
+          user: "username",
+          pwd:  passwordPrompt(),   // or cleartext password
+          roles: [ "root" ]
+      }
+  )
+
+# To create user with perm RW on db
+db.createUser(
+    {
+        user: "WORKER_USERNAME",
+        pwd:  passwordPrompt(),   // or cleartext password
+        roles: [{ role: "readWrite", db: "cuckoo" }]
+    }
+)
+```
+
+### [06-06-2021] Ratelimit strikes again
+* Reintroduce ratelimit to control abuses
+
+### [04-06-2021]
+* Allow anon users list reports and view them
+    * `conf/web.conf ->  general -> anon_viewable`
+
+### [31-05-2021]
+* Monitor updates:
+    * Fixes for NtCreateProcessEx hook, regsvr32 arg parsing, branch tracing (debugger)
+    * Remove instruction filtering from ntdll protection
+    * Add more debug logging to YaraHarness
+
+### [15-05-2021]
+* Reports download moved to main page, under file info as Strings, VirusTotal, Mitre
+
+### [02-05-2021] [Square Hammer](https://youtu.be/VqoyKzgkqR4)
+* Add button to ban user and their pending tasks on admin tab
+    * __ACTION REQUIRED!__
+        * `cd utils/db_migration/ && alembic upgrade head`
+        * `sudo systemctl restart cape.service cape-web.service`
+
+### [01-05-2021]
+* Dirty cluster admin utils helper -> `admin/admin.py`, see `-h`
+
+### [28-04-2021]
+* Strings tab are under the file info on main page
+* VirusTotal tab are also under the file info on main page
+* VT apiv3 integrated
+
 ### [23-04-2021]
 * Pyattck v3.0.1 support
 * If you are using alternative location to `/opt/CAPEv2` and wants to use `MITRE TTPs` next action is required:
@@ -14,13 +1446,13 @@
 
 ### [06-04-2021] Small performance improvements
 * New dependecy `ujson`
-    * __REQUIRED ACTION:__ -> `pip3 install ujson -U`
+    * __REQUIRED ACTION:__ -> `poetry run pip install ujson -U`
 
 
-### [23-03-2021] API Suscription
+### [23-03-2021] API Subscription
 * Default 5/m, it can be changed using Django Admin in user profile. ratelimit is deprecated
 * This was done with huge help from those writeups
-    - [How to add susctiption based throtting to django](https://dev.to/mattschwartz/how-to-add-subscription-based-throttling-to-a-django-api-28j0)
+    - [How to add subscription based throtting to django](https://dev.to/mattschwartz/how-to-add-subscription-based-throttling-to-a-django-api-28j0)
     - [How to add custom fields to user profile](https://simpleisbetterthancomplex.com/tutorial/2016/11/23/how-to-add-user-profile-to-django-admin.html)
 
 * __REQUIRED ACTION:__ -> `cd web && python3 manage.py migrate`
@@ -29,19 +1461,19 @@
 ### [09-02-2021] Registration more configrations
 * Allow enable/disable all new users to activate them by hand
 * Disable new users after email verification if set `manual_approve` in `conf/web.conf`
-* __REQUIRED ACTION:__ -> `pip3 install django-extensions`
+* __REQUIRED ACTION:__ -> `poetry run pip install django-extensions`
 
 ### [05-02-2021] Volatility3 integration done, some future optimizations might come later
 * ToDo: pass yara file to exec yarascan
 * Thanks to Xabier Ugarte-Pedrero and dadokkio for their work
-* `pip3 install volatility3`, then check
+* `poetry run pip install volatility3`, then check
     * `conf/processing.conf` -> `[memory]`
     * `conf/memory.conf` for the plugins
 
 * You will need to download `symbols`, see [volatility3 readme for details](https://github.com/volatilityfoundation/volatility3)
 
 ### [03-02-2021]
-* ratelimit 4 upgrade -> `pip3 install django-ratelimit -U`
+* ratelimit 4 upgrade -> `poetry run pip install django-ratelimit -U`
 
 ### [02-02-2021]
 * Link task to user_id, to be able to ban spammers and bad users
@@ -54,7 +1486,7 @@
     * just replace `/api/` to `/apiv2/` in your urls
 * Current API will be removed in future, so move toward new one
 * Updated API [documentation](https://capev2.readthedocs.io/en/latest/usage/api.html)
-* New dependency: `pip3 install djangorestframework`
+* New dependency: `poetry run pip install djangorestframework`
 * __REQUIRED ACTION:__ -> `cd /opt/CAPEv2/web/`
     * `python3 manage.py migrate && python3 manage.py collectstatic`
 
@@ -74,7 +1506,7 @@
 ### [14-01-2021] [Headers Quality](https://adamj.eu/tech/2019/04/10/how-to-score-a+-for-security-headers-on-your-django-website/)
 * [Content Security Policy](https://www.laac.dev/blog/content-security-policy-using-django/) - [writeup](https://www.laac.dev/blog/content-security-policy-using-django/)
 * [2FA for Django Admin](https://hackernoon.com/5-ways-to-make-django-admin-safer-eb7753698ac8)
-* New dependency: `pip3 install django-otp qrcode`
+* New dependency: `poetry run pip install django-otp qrcode`
  __REQUIRED ACTION:__ -> `cd /opt/CAPEv2/web/`
     * `python3 manage.py migrate` if no you will get `no such table: otp_totp_totpdevice`
 
@@ -82,12 +1514,12 @@
 * Adding [bootstrap-social](https://github.com/peterblazejewicz/bootstrap-social) to simplify sign buttons integration
 * Move SSO providers config to from `web/web/settings.py` to `web/web/local_settings.py`
 * `[oauth]` added to `conf/web.conf` for future on/off of the buttons
-* New dependency: `pip3 install django-settings-export`
+* New dependency: `poetry run pip install django-settings-export`
 
 ### [10-01-2020] Scrappers&Bots nightmare :)
 * Add Web signup/SSO, email verification - [more details](https://django-allauth.readthedocs.io/en/latest/overview.html) - Amazing [writeup](https://www.theophilusn.com/blog/django-with-bootstrap-4) was used for integration
 * [ReCaptcha protected admin](https://github.com/axil/django-captcha-admin/)
-* New dependencies -> `pip3 install django-allauth django-recaptcha==2.0.6 django-crispy-forms git+https://github.com/CAPESandbox/httpreplay.git`
+* New dependencies -> `poetry run pip install django-allauth django-recaptcha==2.0.6 django-crispy-forms git+https://github.com/CAPESandbox/httpreplay.git`
 * __REQUIRED ACTION:__ -> `cd /opt/CAPEv2/web/`
     * `python3 manage.py migrate` if no you will get `No such table as django_site`
     * `python3 manage.py collectstatic` -> to enable django admin css -> requires web/web/local_settings.py modifiy `STATIC_ROOT`

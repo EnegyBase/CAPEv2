@@ -6,10 +6,10 @@ As explained in :doc:`../usage/packages`, analysis packages are structured
 Python classes that describe how CAPE's analyzer component should conduct
 the analysis procedure for a given file inside the guest environment.
 
-As you already know, you can create your own packages and add them along with
+As you already know, you can create your packages and add them along with
 the default ones.
 Designing new packages is very easy and requires just a minimal understanding
-of programming and of the Python language.
+of programming and the Python language.
 
 Getting started
 ===============
@@ -29,9 +29,9 @@ Windows executables (located at *analyzer/windows/packages/exe.py*):
                 args = self.options.get("arguments")
                 return self.execute(path, args)
 
-It seems really easy, thanks to all method inherited by Package object.
-Let's have a look as some of the main methods an analysis package inherits from
-Package object:
+It seems easy, thanks to all methods inherited by the Package object.
+Let's have a look at some of the main methods an analysis package inherits from
+the Package object:
 
     .. code-block:: python
         :linenos:
@@ -39,7 +39,7 @@ Package object:
         from lib.api.process import Process
         from lib.common.exceptions import CuckooPackageError
 
-        class Package(object):
+        class Package:
             def start(self):
                 raise NotImplementedError
 
@@ -75,7 +75,7 @@ Let's walk through the code:
     * Line **1**: import the ``Process`` API class, which is used to create and manipulate Windows processes.
     * Line **2**: import the ``CuckooPackageError`` exception, which is used to notify issues with the execution of the package to the analyzer.
     * Line **4**: define the main class, inheriting ``object``.
-    * Line **5**: define the ``start()`` function, which takes as argument the path to the file to execute. It should be implemented by each analysis package.
+    * Line **5**: define the ``start()`` function, which takes as an argument the path to the file to execute. It should be implemented by each analysis package.
     * Line **8**: define the ``check()`` function.
     * Line **13**: acquire the ``free`` option, which is used to define whether the process should be monitored or not.
     * Line **18**: initialize a ``Process`` instance.
@@ -95,7 +95,7 @@ Let's walk through the code:
 
 In this function you have to place all the initialization operations you want to run.
 This may include running the malware process, launching additional applications,
-taking memory snapshots and more.
+taking memory snapshots, and more.
 
 ``check()``
 -----------
@@ -103,7 +103,7 @@ taking memory snapshots and more.
 This function is executed by CAPE every second while the malware is running.
 You can use this function to perform any kind of recurrent operation.
 
-For example if in your analysis you are looking for just one specific indicator to
+For example, if in your analysis you are looking for just one specific indicator to
 be created (e.g. a file) you could place your condition in this function and if
 it returns ``False``, the analysis will terminate straight away.
 
@@ -123,7 +123,7 @@ whenever *C:\\config.bin* is created.
 ``execute()``
 -------------
 
-Wraps the malware execution and deal with DLL injection.
+Wraps the malware execution and deals with DLL injection.
 
 ``finish()``
 ------------
@@ -136,10 +136,10 @@ all the monitored processes.
 Options
 =======
 
-Every package have automatically access to a dictionary containing all user-specified
+Every package has automatically access to a dictionary containing all user-specified
 options (see :doc:`../usage/submit`).
 
-Such options are made available in the attribute ``self.options``. For example let's
+Such options are made available in the attribute ``self.options``. For example, let's
 assume that the user specified the following string at submission::
 
     foo=1,bar=2
@@ -162,11 +162,93 @@ The analysis package selected will have access to these values::
 
 These options can be used for anything you might need to configure inside your package.
 
+Package Configuration
+=====================
+
+Analysis packages can be "configured" before being started. Package configuration comes
+in two forms:
+
+#. Public configuration
+#. Private configuration
+
+Public configuration is stored within the analysis package class itself. Private
+configuration is stored externally, as data added to CAPE at runtime, separate from the
+CAPE Python code.
+
+Public Package Configuration
+----------------------------
+
+Public package configuration is stored directly in the analysis package itself.
+This form of configuration is useful when configuring the host execution environment
+before the analysis is started.
+
+For example, here is a alternative PDF package with lowered security settings:
+
+    .. code-block:: python
+        :linenos:
+
+        from lib.common.abstracts import Package
+        from lib.common.exceptions import CuckooPackageError
+        from lib.common.registry import *
+
+
+        class PDFLS(Package):
+            """PDF analysis package, with lowered security settings."""
+
+            PATHS = [
+                ("ProgramFiles", "Adobe", "Acrobat DC", "Acrobat", "Acrobat.exe"),
+            ]
+
+            def __init__(self, options=None, config=None):
+                """@param options: options dict."""
+                if options is None:
+                    options = {}
+                self.config = config
+                self.options = options
+                self.options["pdf"] = "1"
+
+            def configure(self, target):
+                rootkey, subkey = "HKEY_CURRENT_USER", r"SOFTWARE\Adobe\Adobe Acrobat\DC"
+                set_regkey(rootkey, fr"{subkey}\Privileged", "bProtectedMmode", REG_DWORD, 0)
+                set_regkey(rootkey, fr"{subkey}\JSPrefs", "bEnableJS", REG_DWORD, 1)
+                set_regkey(rootkey, fr"{subkey}\JSPrefs", "bEnableGlobalSecurity", REG_DWORD, 0)
+
+            def start(self, path):
+                reader = self.get_path_glob("Acrobat.exe")
+                return self.execute(reader, f'"{path}"', path)
+
+
+Private Package Configuration
+-----------------------------
+
+Private package configuration is stored outside the analysis package class, in a module
+under the same name as the analysis package. This is useful when managing configuration
+of package capabilities separately is desired, for privacy reasons or otherwise.
+
+For example, here is a private package configuration for exe analysis that disables
+ASLR for the target being analyzed:
+
+    .. code-block:: python
+        :linenos:
+
+        # data/packages/exe.py
+        import lief
+
+        def configure(package, target):
+            # here "package" refers to modules.packages.exe.Exe
+            if package.options.get("disable-aslr"):
+                pe_binary = lief.parse(target)
+                old_flags = pe_binary.optional.header.dll_characteristics
+                # unset DYNAMIC_BASE
+                new_flags = (old_flags & ~lief.PE.OptionalHeader.DLL_CHARACTERISTICS.DYNAMIC_BASE)
+                pe_binary.optional_header.dll_characteristics = new_flags
+                pe_binary.write(target)
+
 Process API
 ===========
 
 The ``Process`` class provides access to different process-related features and functions.
-You can import it in your analysis packages with::
+You can import it into your analysis packages with::
 
     from lib.api.process import Process
 
@@ -182,7 +264,7 @@ specify multiple arguments:
     * ``thread_id``: thread ID of a process you want to operate on.
     * ``h_thread``: handle of the thread of a process you want to operate on.
 
-This class implements several methods that you can use in your own scripts.
+This class implements several methods that you can use in your scripts.
 
 Methods
 -------

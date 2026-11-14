@@ -5,7 +5,7 @@ $(function() {
   //Apply only when we reload the same page
   if (document.referrer === document.URL){
     //for bootstrap 3 use 'shown.bs.tab' instead of 'shown' in the next line
-    $('a[data-toggle="tab"]').on('click', function (e) {
+    $('a[data-bs-toggle="tab"]').on('click', function (e) {
       localStorage.setItem('lastAnalysisTab', $(e.target).attr('href'));
     });
 
@@ -15,126 +15,254 @@ $(function() {
         $('a[href="'+lastAnalysisTab+'"]').click();
     }
   }
-  // ajax req for some tabs
-  $('[data-toggle="tabajax"]').click(function(e) {
-    var $this = $(this),
-        url = $(this).attr("data-url");
-
-    if (typeof url !== "undefined") {
-        var pane = $(this), href = this.hash;
-        $(href).load(url,function(result){
-            pane.tab('show');
-        });
-    } else {
-         $(this).tab('show');
-    }
-    return false;
-    });
-    //end
+  //end
 });
 </script>
 <style type="text/css">
 .alert-tlp_green {
-    background-color: #008000;
-    padding: 3px;
-    padding-left: 10px;
-    margin-bottom: 3px;
-    text-align: center;
-    font-size: 12;
+  background-color: black;
+  color: rgb(51, 255, 0);
 }
 .alert-tlp_amber {
-    background-color: #FFBF00;
-    padding: 3px;
-    padding-left: 10px;
-    margin-bottom: 3px;
-    text-align: center;
-    font-size: 12;
+  background-color: black;
+  color: rgb(255, 192, 0);
 }
 .alert-tlp_red {
-    background-color: #FF2626;
-    padding: 3px;
-    padding-left: 10px;
-    margin-bottom: 3px;
-    text-align: center;
-    font-size: 12;
+  background-color: black;
+  color: rgb(255, 43, 43);
 }
 </style>
 {% if analysis.info.tlp %}
-    {% if analysis.info.tlp == "Red" %}
-    <div class="alert alert-tlp_red">
-    {% elif analysis.info.tlp == "Amber" %}
-    <div class="alert alert-tlp_amber">
-    {% elif analysis.info.tlp == "Green" %}
-        <div class="alert alert-tlp_amber">
-    {% endif %}
-    </div>
+  <div
+    class="mt-1 mb-1 p-1 fw-bold text-center alert-tlp_{{ analysis.info.tlp|lower }}"
+    aria-controls="alert-tlp-description"
+    aria-expanded="false"
+    data-bs-target="#alert-tlp-description"
+    data-bs-toggle="collapse"
+    role="button"
+  >
+    TLP:{{ analysis.info.tlp|upper }}
+  </div>
+
+  <div class="mt-1 mb-1 p-2 collapse text-center" id="alert-tlp-description">
+  {% if analysis.info.tlp|lower == "red" %}
+    Analysis report (including the sample) MUST NOT be mentioned, shared or exported outside of the system by the users.
+  {% elif analysis.info.tlp|lower == "amber" %}
+    Analysis report (including the sample) MAY be shared on a need-to-know basis within organization.
+  {% elif analysis.info.tlp|lower == "green" %}
+    Analysis report (including the sample) MAY be shared within community but SHOULD NOT be shared via publicly accessible channels.
+  {% endif %}
+  </div>
 {% endif %}
 
-<ul class="nav nav-tabs">
-    <li class="nav-item"><a class="nav-link active" href="#overview" data-toggle="tab">Quick Overview</a></li>
-    {% if analysis.static or config.virustotal and analysis.virustotal %}
-        <li class="nav-item"><a class="nav-link" href="#static" data-toggle="tab">Static Analysis</a></li>
-    {% endif %}
-    {% if analysis.info.category != "pcap" and analysis.info.category != "static" %}
-        <li class="nav-item"><a class="nav-link" href="#behavior" data-toggle="tabajax" data-url="/analysis/load_files/{{analysis.info.id}}/behavior/" data-toggle="tab">Behavioral Analysis</a></li>
+<ul class="nav nav-pills nav-fill bg-dark rounded shadow-sm p-1 mb-3" id="reportTabs" role="tablist">
+    <li class="nav-item">
+        <a class="nav-link active" id="overview-tab" href="#overview" data-bs-toggle="tab" role="tab" aria-controls="overview" aria-selected="true">
+            <i class="fas fa-eye me-2"></i>Quick Overview
+        </a>
+    </li>
+    {% if analysis.info.machine.platform == "linux" %}
+        <li class="nav-item">
+            <a class="nav-link" id="strace-tab" href="#strace"
+               hx-get="/analysis/load_files/{{analysis.info.id}}/strace/"
+               hx-target="#strace"
+               hx-trigger="click once"
+               data-bs-toggle="tab" role="tab" aria-controls="strace" aria-selected="false">
+                <i class="fas fa-project-diagram me-2"></i>Behavioral Analysis
+            </a>
+        </li>
+        {% if config.tracee %}
+        <li class="nav-item">
+            <a class="nav-link" id="tracee-tab" href="#tracee"
+               hx-get="/analysis/load_files/{{analysis.info.id}}/tracee/"
+               hx-target="#tracee"
+               hx-trigger="click once"
+               data-bs-toggle="tab" role="tab" aria-controls="tracee" aria-selected="false">
+                <i class="fas fa-search me-2"></i>Detailed Behaviour (Tracee)
+            </a>
+        </li>
+        {% endif %}
+    {% elif analysis.info.category != "pcap" and analysis.info.category != "static" %}
+        <li class="nav-item">
+            <a class="nav-link" id="behavior-tab" href="#behavior"
+               hx-get="/analysis/load_files/{{analysis.info.id}}/behavior/"
+               hx-target="#behavior"
+               hx-trigger="click once"
+               data-bs-toggle="tab" role="tab" aria-controls="behavior" aria-selected="false">
+                <i class="fas fa-project-diagram me-2"></i>Behavioral Analysis
+            </a>
+        </li>
     {% endif %}
     {% if analysis.info.category != "static" %}
-        <li class="nav-item"><a class="nav-link" href="#network" data-toggle="tabajax" data-url="/analysis/load_files/{{analysis.info.id}}/network/" data-toggle="tab">Network Analysis</a></li>
+        <li class="nav-item">
+            <a class="nav-link" id="network-tab" href="#network"
+               hx-get="/analysis/load_files/{{analysis.info.id}}/network/"
+               hx-target="#network"
+               hx-trigger="click once"
+               data-bs-toggle="tab" role="tab" aria-controls="network" aria-selected="false">
+                <i class="fas fa-network-wired me-2"></i>Network Analysis
+            </a>
+        </li>
     {% endif %}
     {% if analysis.info.category != "pcap" and analysis.info.category != "static" %}
         {% if analysis.dropped %}
-            <li class="nav-item"><a class="nav-link" href="#dropped" data-toggle="tabajax" data-url="/analysis/load_files/{{analysis.info.id}}/dropped/" data-toggle="tab">Dropped Files ({{analysis.dropped}})</a></li>
+            <li class="nav-item">
+                <a class="nav-link" id="dropped-tab" href="#dropped"
+                   hx-get="/analysis/load_files/{{analysis.info.id}}/dropped/"
+                   hx-target="#dropped"
+                   hx-trigger="click once"
+                   data-bs-toggle="tab" role="tab" aria-controls="dropped" aria-selected="false">
+                    <i class="fas fa-file-download me-2"></i>Dropped Files ({{analysis.dropped}})
+                </a>
+            </li>
         {% endif %}
-        {% if analysis.procmemory|length %}
-            <li class="nav-item"><a class="nav-link" href="#procmemory" data-toggle="tab" >Process Memory ({{analysis.procmemory|length}})</a></li>
+        {% if analysis.procmemory %}
+            <li class="nav-item">
+                <a class="nav-link" id="procmemory-tab" href="#procmemory"
+                   hx-get="/analysis/load_files/{{analysis.info.id}}/procmemory/"
+                   hx-target="#procmemory"
+                   hx-trigger="click once"
+                   data-bs-toggle="tab" role="tab" aria-controls="procmemory" aria-selected="false">
+                    <i class="fas fa-memory me-2"></i>Process Memory ({{analysis.procmemory}})
+                </a>
+            </li>
         {% endif %}
         {% if analysis.memory %}
-            <li class="nav-item"><a class="nav-link" href="#memory" data-toggle="tabajax" data-url="/analysis/load_files/{{analysis.info.id}}/memory/" data-toggle="tab">Memory Analysis</a></li>
+            <li class="nav-item">
+                <a class="nav-link" id="memory-tab" href="#memory"
+                   hx-get="/analysis/load_files/{{analysis.info.id}}/memory/"
+                   hx-target="#memory"
+                   hx-trigger="click once"
+                   data-bs-toggle="tab" role="tab" aria-controls="memory" aria-selected="false">
+                    <i class="fas fa-microchip me-2"></i>Memory Analysis
+                </a>
+            </li>
         {% endif %}
         {% if analysis.procdump %}
-            <li class="nav-item"><a class="nav-link" href="#procdump" data-toggle="tabajax" data-url="/analysis/load_files/{{analysis.info.id}}/procdump/">Process Dumps ({{analysis.procdump}})</a></li>
+            <li class="nav-item">
+                <a class="nav-link" id="procdump-tab" href="#procdump"
+                   hx-get="/analysis/load_files/{{analysis.info.id}}/procdump/"
+                   hx-target="#procdump"
+                   hx-trigger="click once"
+                   data-bs-toggle="tab" role="tab" aria-controls="procdump" aria-selected="false">
+                    <i class="fas fa-database me-2"></i>Process Dumps ({{analysis.procdump}})
+                </a>
+            </li>
         {% endif %}
         {% if analysis.CAPE %}
-            <li class="nav-item"><a class="nav-link" href="#CAPE" data-toggle="tabajax" data-url="/analysis/load_files/{{analysis.info.id}}/CAPE/" data-toggle="tab">Payloads ({{analysis.CAPE}})</a></li>
-        {% endif%}
-        <!--ToDo remove in CAPEv3-->
-        {% if analysis.CAPE_old %}
-            <li class="nav-item"><a class="nav-link" href="#CAPE_old" data-toggle="tabajax" data-url="/analysis/load_files/{{analysis.info.id}}/CAPE_old/" data-toggle="tab">CAPE ({{analysis.CAPE_old}})</a></li>
+            <li class="nav-item">
+                <a class="nav-link" id="CAPE-tab" href="#CAPE"
+                   hx-get="/analysis/load_files/{{analysis.info.id}}/CAPE/"
+                   hx-target="#CAPE"
+                   hx-trigger="click once"
+                   data-bs-toggle="tab" role="tab" aria-controls="CAPE" aria-selected="false">
+                    <i class="fas fa-bug me-2"></i>Payloads ({{analysis.CAPE}})
+                </a>
+            </li>
         {% endif%}
         {% if analysis.debugger_logs %}
-            <li class="nav-item"><a class="nav-link" href="#debugger" data-toggle="tabajax" data-url="/analysis/load_files/{{analysis.info.id}}/debugger/" data-toggle="tab">Debugger</a></li>
+            <li class="nav-item">
+                <a class="nav-link" id="debugger-tab" href="#debugger"
+                   hx-get="/analysis/load_files/{{analysis.info.id}}/debugger/"
+                   hx-target="#debugger"
+                   hx-trigger="click once"
+                   data-bs-toggle="tab" role="tab" aria-controls="debugger" aria-selected="false">
+                    <i class="fas fa-wrench me-2"></i>Debugger
+                </a>
+            </li>
         {% endif %}
-        {% if reports_exist %}
-            <li class="nav-item"><a class="nav-link" href="#reports" data-toggle="tab">Reports</a></li>
-        {% endif %}
+    {% endif %}
+    {% if analysis.sigma or analysis.sysmon or analysis.has_evtx %}
+        <li class="nav-item">
+            <a class="nav-link" id="eventlogs-tab" href="#eventlogs"
+               hx-get="/analysis/load_files/{{analysis.info.id}}/eventlogs/"
+               hx-target="#eventlogs"
+               hx-trigger="click once"
+               data-bs-toggle="tab" role="tab" aria-controls="eventlogs" aria-selected="false">
+                <i class="fas fa-scroll me-2"></i>Event Logs
+            </a>
+        </li>
+    {% endif %}
+    {% if analysis.has_etw and config.display_etw %}
+        <li class="nav-item">
+            <a class="nav-link" id="etw-tab" href="#etw"
+               hx-get="/analysis/load_files/{{analysis.info.id}}/etw/"
+               hx-target="#etw"
+               hx-trigger="click once"
+               data-bs-toggle="tab" role="tab" aria-controls="etw" aria-selected="false">
+                <i class="fas fa-broadcast-tower me-2"></i>ETW Telemetry
+            </a>
+        </li>
     {% endif %}
     {% if settings.COMMENTS %}
-        {% if analysis.info.comments|length %}
-            <li class="nav-item"><a class="nav-link" href="#comments" data-toggle="tab">Comments ({{analysis.info.comments|length}})</a></li>
-        {% else %}
-            <li class="nav-item"><a class="nav-link" href="#comments" data-toggle="tab">Comments</a></li>
-        {% endif %}
+        <li class="nav-item">
+            {% if analysis.info.comments|length %}
+                <a class="nav-link" id="comments-tab" href="#comments" data-bs-toggle="tab" role="tab" aria-controls="comments" aria-selected="false">
+                    <i class="fas fa-comments me-2"></i>Comments ({{analysis.info.comments|length}})
+                </a>
+            {% else %}
+                <a class="nav-link" id="comments-tab" href="#comments" data-bs-toggle="tab" role="tab" aria-controls="comments" aria-selected="false">
+                    <i class="fas fa-comments me-2"></i>Comments
+                </a>
+            {% endif %}
+        </li>
     {% endif %}
     {% if analysis.misp %}
-            <li class="nav-item"><a class="nav-link" href="#misp" data-toggle="tab">MISP</a></li>
+        <li class="nav-item">
+            <a class="nav-link" id="misp-tab" href="#misp" data-bs-toggle="tab" role="tab" aria-controls="misp" aria-selected="false">
+                <i class="fas fa-share-alt me-2"></i>MISP
+            </a>
+        </li>
     {% endif %}
-    {% if analysis.backscatter %}<li class="nav-item"><a class="nav-link" href="#backscatter" data-toggle="tab">Backscatter</a></li>{% endif %}
-    {% if analysis.classification%}<li class="nav-item"><a class="nav-link" href="#classification" data-toggle="tab">Classification</a> </li>{% endif %}
-    {% if analysis.curtain%}<li class="nav-item"> <a class="nav-link" href="#curtain" data-toggle="tab">Curtain</a></li>{% endif %}
-    <li class="nav-item"><a class="nav-link" href="#statistics" data-toggle="tab">Statistics</a></li>
-    {% if analysis.info.category == "file" and analysis.target %}<li class="nav-item"><a class="nav-link" href="{% url "compare_left" analysis.info.id %}">Compare this analysis to...</a></li>{% endif %}
-    {% if settings.ADMIN or user.is_staff %}<li class="nav-item"><a class="nav-link" href="#admin" data-toggle="tab">Admin</a></li>{% endif %}
+    {% if analysis.backscatter %}
+        <li class="nav-item">
+            <a class="nav-link" id="backscatter-tab" href="#backscatter" data-bs-toggle="tab" role="tab" aria-controls="backscatter" aria-selected="false">
+                <i class="fas fa-radiation me-2"></i>Backscatter
+            </a>
+        </li>
+    {% endif %}
+    {% if analysis.classification %}
+        <li class="nav-item">
+            <a class="nav-link" id="classification-tab" href="#classification" data-bs-toggle="tab" role="tab" aria-controls="classification" aria-selected="false">
+                <i class="fas fa-tags me-2"></i>Classification
+            </a>
+        </li>
+    {% endif %}
+    {% if analysis.info.category == "file" and analysis.target %}
+        <li class="nav-item">
+            <a class="nav-link" href="{% url "compare_left" analysis.info.id %}">
+                <i class="fas fa-balance-scale me-2"></i>Compare this analysis to...
+            </a>
+        </li>
+    {% endif %}
+    {% if settings.ADMIN or user.is_staff %}
+        <li class="nav-item">
+            <a class="nav-link" id="admin-tab" href="#admin" data-bs-toggle="tab" role="tab" aria-controls="admin" aria-selected="false">
+                <i class="fas fa-user-shield me-2"></i>Admin
+            </a>
+        </li>
+    {% endif %}
 </ul>
+<div class="d-none d-xl-flex justify-content-end mb-2">
+    <button id="btn-toggle-layout" class="btn btn-sm btn-outline-info" title="Toggle between Centered and Full Screen layout">
+        <i class="fas fa-expand me-1"></i> Full Screen
+    </button>
+</div>
 <div class="tab-content">
     <div class="tab-pane fade show active" id="overview">
         {% include "analysis/overview/index.html" %}
     </div>
-    {% if analysis.static or analysis.strings or config.virustotal and analysis.virustotal %}
-    <div class="tab-pane fade" id="static">
-        {% include "analysis/static/index.html" %}
+    <div class="tab-pane fade" id="behavior">
+        {% include "analysis/behavior/index.html" %}
+    </div>
+    <div class="tab-pane fade" id="strace">
+        {% include "analysis/strace/index.html" %}
+    </div>
+    {% if analysis.info.machine.platform == "linux" and config.tracee %}
+    <div class="tab-pane fade" id="tracee">
+        {% include "analysis/tracee/index.html" %}
     </div>
     {% endif %}
-    <div class="tab-pane fade" id="behavior">{% include "analysis/behavior/index.html" %}</div>
     <div class="tab-pane fade" id="network">
         {% include "analysis/network/index.html" %}
     </div>
@@ -144,12 +272,6 @@ $(function() {
     {% if analysis.CAPE %}
         <div class="tab-pane fade" id="CAPE">
         {% include "analysis/CAPE/index.html" %}
-        </div>
-    {% endif %}
-    <!--ToDo remve in CAPEv3-->
-    {% if analysis.CAPE_old %}
-        <div class="tab-pane fade" id="CAPE_old">
-        {% include "analysis/CAPE/index_old.html" %}
         </div>
     {% endif %}
     <div class="tab-pane fade" id="procdump">
@@ -172,9 +294,6 @@ $(function() {
         </div>
         {% endif %}
     {% endif %}
-    <div class="tab-pane fade" id="reports">
-        {% include "analysis/reports/index.html" %}
-    </div>
     {% if settings.COMMENTS %}
     <div class="tab-pane fade" id="comments">
         {% include "analysis/comments/index.html" %}
@@ -190,6 +309,17 @@ $(function() {
             {% include "analysis/debugger/index.html" %}
         </div>
     {% endif %}
+    {% if analysis.sigma or analysis.sysmon or analysis.has_evtx %}
+        <div class="tab-pane fade" id="eventlogs">
+            {% include "analysis/eventlogs/index.html" %}
+        </div>
+    {% endif %}
+    {% if analysis.has_etw and config.display_etw %}
+        <div class="tab-pane fade" id="etw">
+            {# Populated via load_files AJAX (category='etw'). Leaves a
+               minimal placeholder so the tabajax handler has a target. #}
+        </div>
+    {% endif %}
     {% if analysis.backscatter %}
     <div class="tab-pane fade" id="backscatter">
         {% include "analysis/backscatter.html" %}
@@ -200,18 +330,47 @@ $(function() {
         {% include "analysis/classification.html" %}
     </div>
     {% endif %}
-    {% if analysis.curtain %}
-    <div class="tab-pane fade" id="curtain">
-        {% include "analysis/curtain.html" %}
-    </div>
-    {% endif %}
-    <div class="tab-pane fade" id="statistics">
-        {% include "analysis/statistics/index.html" %}
-    </div>
     {% if settings.ADMIN or user.is_staff %}
     <div class="tab-pane fade" id="admin">
         {% include "analysis/admin/index.html" %}
     </div>
     {% endif %}
 </div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+$(function() {
+    const toggleBtn = $('#btn-toggle-layout');
+    if (!toggleBtn.length) return;
+
+    function applyLayout(layout) {
+        const targets = $('.dynamic-layout-target');
+        if (layout === 'fluid') {
+            targets.removeClass('layout-centered');
+            toggleBtn.html('<i class="fas fa-compress me-1"></i> Center Layout');
+        } else { // centered
+            targets.addClass('layout-centered');
+            toggleBtn.html('<i class="fas fa-expand me-1"></i> Full Screen');
+        }
+    }
+
+    let currentLayout = localStorage.getItem('report-layout') || 'centered';
+    applyLayout(currentLayout);
+
+    toggleBtn.on('click', function() {
+        currentLayout = (currentLayout === 'centered') ? 'fluid' : 'centered';
+        localStorage.setItem('report-layout', currentLayout);
+        applyLayout(currentLayout);
+    });
+
+    // Re-apply layout on AJAX completes (for dynamically loaded tabs)
+    $(document).ajaxComplete(function() {
+        const savedLayout = localStorage.getItem('report-layout') || 'centered';
+        // Update state variable in case it was changed in another tab.
+        currentLayout = savedLayout;
+        applyLayout(savedLayout);
+    });
+});
+</script>
 {% endblock %}

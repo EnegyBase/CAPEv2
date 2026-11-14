@@ -2,58 +2,100 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
-import os
 import logging
+import os
 import socket
 import time
+from pathlib import Path
 
+from lib.common.parse_pe import is_pe_image, pe_trimmed_size
 from lib.core.config import Config
+
+config = Config(cfg="analysis.conf")
 
 log = logging.getLogger(__name__)
 
 BUFSIZE = 1024 * 1024
 
 
-def upload_to_host(file_path, dump_path, pids=[], metadata="", category="", duplicated=False):
-    nc = None
-    infd = None
-    we_open = False
+def get_upload_size(path):
+    size = Path(path).stat().st_size
+    if int(config.upload_max_size) < size and not config.do_upload_max_size:
+        if config.enable_trim and is_pe_image(path):
+            new_size = pe_trimmed_size(path)
+            if new_size:
+                size = new_size
+                if int(config.upload_max_size) < size and not config.do_upload_max_size:
+                    log.warning("PE File %s size is too big: %d, trim failed to bring size down", path, size)
+                    return
+            else:
+                log.warning("PE File %s size is too big: %d, trim failed - check pefile is installed in guest", path, size)
+                return
+        else:
+            log.warning("File %s size is too big: %d, ignoring", path, size)
+            return
+    return size
+
+
+def upload_to_host(file_path, dump_path, pids="", ppids="", metadata="", category="", duplicated=False):
     if not os.path.exists(file_path):
-        log.warning("File {} doesn't exist anymore".format(file_path))
+        log.warning("File %s doesn't exist anymore", file_path)
+        return
+
+    size = get_upload_size(file_path)
+    if not size:
+        return
+
+    log.info("Uploading file %s to %s; Size is %d; Max size: %s", file_path, dump_path, size, config.upload_max_size)
+    try:
+        with NetlogFile() as nc:
+            nc.init(dump_path, file_path, pids, ppids, metadata, category, duplicated)
+            if not duplicated and file_path:
+                with open(file_path, "rb") as infd:
+                    buf = infd.read(BUFSIZE)
+                    while buf:
+                        read_size = len(buf)
+                        nc.send(buf[:size], retry=True)
+                        if read_size > size:
+                            break
+                        size -= read_size
+                        buf = infd.read(BUFSIZE)
+    except Exception as e:
+        log.exception("Exception uploading file %s to host: %s", file_path, e)
+
+
+def upload_buffer_to_host(buffer, dump_path, filepath=False, pids="", ppids="", metadata="", category="", duplicated=False):
+    size = len(buffer)
+    log.info("Uploading buffer to %s; Size: %d", dump_path, size)
+    if int(config.upload_max_size) < size and not config.do_upload_max_size:
+        log.warning("Buffer is too big: %d; max size: %d", size, config.upload_max_size)
         return
     try:
-        nc = NetlogFile()
-        # nc = NetlogBinary(file_path.encode("utf-8", "replace"), dump_path, duplicate)
-        nc.init(dump_path, file_path, pids, metadata, category, duplicated)
-        if not duplicated:
-            if not infd and file_path:
-                infd = open(file_path, "rb")  # rb
-                we_open = True
-            buf = infd.read(BUFSIZE)
-            while buf:
-                nc.send(buf, retry=True)
-                buf = infd.read(BUFSIZE)
-    except Exception as e:
-        log.error("Exception uploading file {0} to host: {1}".format(file_path, e), exc_info=True)
-    finally:
-        if infd and we_open:
-            infd.close()
-        if nc:
-            nc.close()
+        with NetlogFile() as nc:
+            nc.init(dump_path, filepath, pids, ppids, metadata, category, duplicated)
+            if not duplicated:
+                idx = 0
+                while idx < size:
+                    nc.send(buffer[idx : idx + BUFSIZE], retry=True)
+                    idx += BUFSIZE
+    except Exception:
+        log.exception("Exception uploading buffer %s to host.", dump_path)
 
 
-class NetlogConnection(object):
+class NetlogConnection:
     def __init__(self, proto=""):
-        config = Config(cfg="analysis.conf")
         self.hostip, self.hostport = config.ip, config.port
         self.sock = None
         self.proto = proto
-        self.connected = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.close()
 
     def connect(self):
-        # Try to connect as quickly as possible. Just sort of force it to
-        # connect with a short timeout.
+        # Try to connect as quickly as possible. Just sort of force it to connect with a short timeout.
         while not self.sock:
             try:
                 s = socket.create_connection((self.hostip, self.hostport), 0.1)
@@ -64,7 +106,6 @@ class NetlogConnection(object):
             self.sock = s
             self.sock.settimeout(None)
             self.sock.sendall(self.proto)
-            self.connected = True
 
     def send(self, data, retry=True):
         if not self.sock:
@@ -77,53 +118,74 @@ class NetlogConnection(object):
                 self.connect()
                 self.send(data, retry=False)
             else:
-                print(("Unhandled exception in NetlogConnection:", str(e)))
+                print(f"Unhandled exception in NetlogConnection: {e}")
         except Exception as e:
-            log.error(("Unhandled exception in NetlogConnection:", str(e)))
+            log.error("Unhandled exception in NetlogConnection: %s", e)
             # We really have nowhere to log this, if the netlog connection
             # does not work, we can assume that any logging won't work either.
             # So we just fail silently.
             self.close()
 
+    def send_fileobj(self, fileobj, retry=True):
+        """Send the remaining contents of a file-like object.
+
+        Iterating a file object (including a BytesIO) yields *lines*, so binary
+        payloads get split on every 0x0A byte: a 155 KB screenshot came out as
+        762 socket writes, the smallest of them a single byte. Reading fixed
+        size chunks instead keeps it to one write per BUFSIZE, and routing them
+        through send() means they go out with sendall() and the reconnect
+        retry, rather than a bare send() whose return value was discarded.
+        """
+        while True:
+            chunk = fileobj.read(BUFSIZE)
+            if not chunk:
+                break
+            self.send(chunk, retry=retry)
+
     def close(self):
+        if not self.sock:
+            return
+
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
             self.sock.close()
             self.sock = None
         except Exception as e:
             print(e)
-            pass
 
 
 class NetlogBinary(NetlogConnection):
     def __init__(self, guest_path, uploaded_path, duplicated):
         if duplicated:
-            NetlogConnection.__init__(self, proto=b"DUPLICATEBINARY\n%s\n%s\n" % (uploaded_path.encode("utf-8", "replace"), guest_path))
+            NetlogConnection.__init__(
+                self, proto=b"DUPLICATEBINARY\n%s\n%s\n" % (uploaded_path.encode("utf-8", "replace"), guest_path)
+            )
         else:
             NetlogConnection.__init__(self, proto=b"BINARY\n%s\n%s\n" % (uploaded_path.encode("utf-8", "replace"), guest_path))
         self.connect()
 
 
 class NetlogFile(NetlogConnection):
-    def init(self, dump_path, filepath=False, pids="", metadata="", category="files", duplicated=0):
+    def init(self, dump_path, filepath=False, pids="", ppids="", metadata="", category="files", duplicated=0):
         """
-            All arguments should be strings
+        All arguments should be strings
         """
-        if pids:
+        if not isinstance(pids, str):
             pids = " ".join(pids)
-        else:
-            pids = ""
+        if not isinstance(ppids, str):
+            ppids = " ".join(ppids)
         if filepath:
-            self.proto = b"FILE 2\n%s\n%s\n%s\n%s\n%s\n%d\n" % (
-                dump_path.encode("utf8"),
+            self.proto = b"FILE 2\n%s\n%s\n%s\n%s\n%s\n%s\n%d\n" % (
+                dump_path.encode(),
                 filepath.encode("utf-8", "replace"),
-                pids.encode("utf8") if isinstance(pids, str) else pids,
-                metadata.encode("utf8") if isinstance(metadata, str) else metadata,
-                category.encode("utf8") if isinstance(category, str) else category,
+                pids.encode(),
+                ppids.encode(),
+                metadata.encode() if isinstance(metadata, str) else metadata,
+                category.encode() if isinstance(category, str) else category,
                 1 if duplicated else 0,
             )
         else:
-            self.proto = b"FILE\n%s\n" % dump_path.encode("utf8")
+            self.proto = b"FILE\n%s\n" % dump_path.encode()
         self.connect()
 
 
@@ -135,4 +197,4 @@ class NetlogHandler(logging.Handler, NetlogConnection):
 
     def emit(self, record):
         msg = self.format(record)
-        self.send(msg.encode("utf-8") + b"\n")
+        self.send(msg.encode() + b"\n")

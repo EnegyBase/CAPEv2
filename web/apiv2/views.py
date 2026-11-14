@@ -1,109 +1,165 @@
 # encoding: utf-8
-from __future__ import absolute_import
+import hashlib
 import json
-import os
-import sys
-import socket
-import tarfile
 import logging
-from io import BytesIO
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import zipfile
+from contextlib import suppress
 from datetime import datetime, timedelta
-from zlib import decompress
-
-import requests
-from django.conf import settings
+from io import BytesIO
+from urllib.parse import quote, urljoin
 from wsgiref.util import FileWrapper
+
+import pyzipper
+import requests
+import yara
+from bson.objectid import ObjectId
+from django.conf import settings
+from sqlalchemy import select
+from django.contrib.auth.decorators import login_required
 from django.http import StreamingHttpResponse
-from django.shortcuts import render, redirect
+from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_safe
-
-
-from rest_framework.response import Response
 from rest_framework.decorators import api_view
-
-from bson.objectid import ObjectId
-from django.contrib.auth.decorators import login_required
+try:
+    from apikey.authentication import ApiKeyAuthentication
+except ImportError:
+    ApiKeyAuthentication = None
+from rest_framework.response import Response
 
 sys.path.append(settings.CUCKOO_PATH)
-from lib.cuckoo.common.objects import File
-from lib.cuckoo.common.config import Config
-from utils.cleaners import delete_mongo_data
-from lib.cuckoo.core.database import TASK_RUNNING
-from lib.cuckoo.common.saztopcap import saz_to_pcap
-from lib.cuckoo.core.database import Database, Task
-from lib.cuckoo.common.quarantine import unquarantine
-from lib.cuckoo.common.exceptions import CuckooDemuxError
-from lib.cuckoo.common.constants import CUCKOO_ROOT, CUCKOO_VERSION
-from lib.cuckoo.common.utils import store_temp_file, delete_folder, sanitize_filename, generate_fake_name
-from lib.cuckoo.common.utils import convert_to_printable, get_user_filename, get_options, validate_referrer
-from lib.cuckoo.common.web_utils import (
-    perform_malscore_search,
-    perform_search,
-    perform_ttps_search,
-    search_term_map,
-    get_file_content,
-    statistics,
-)
-from lib.cuckoo.common.web_utils import download_file, validate_task, apiconf, force_int, _download_file, parse_request_arguments
-from lib.cuckoo.common.web_utils import download_from_vt
 
+from lib.cuckoo.common.config import Config
+from lib.cuckoo.common.constants import ANALYSIS_BASE_PATH, CUCKOO_ROOT, CUCKOO_VERSION
+from lib.cuckoo.common.hooks import apply_route_filter, apply_sql_task_filter
+from lib.cuckoo.common.exceptions import CuckooDemuxError
+from lib.cuckoo.common.path_utils import path_delete, path_exists
+from lib.cuckoo.common.saztopcap import saz_to_pcap
+from lib.cuckoo.common.utils import (
+    convert_to_printable,
+    create_zip,
+    delete_folder,
+    get_cape_external_dir,
+    get_options,
+    get_user_filename,
+    path_get_filename,
+    sanitize_filename,
+    store_temp_file,
+)
+from lib.cuckoo.common.web_utils import (
+    apiconf,
+    download_file,
+    download_from_3rdparty,
+    force_int,
+    parse_request_arguments,
+    perform_search,
+    process_new_dlnexec_task,
+    process_new_task_files,
+    search_term_map,
+    statistics,
+    stop_analysis_task,
+    validate_task,
+)
+
+from lib.cuckoo.core.database import Database, _Database
+from lib.cuckoo.core.data.task import (
+    TASK_RECOVERED,
+    TASK_RUNNING,
+    Task,
+)
+from lib.cuckoo.core.rooter import _load_socks5_operational, vpns
+
+# from mcp.filters import lean_search_filters
+lean_search_filters = {}
 try:
     import psutil
 
     HAVE_PSUTIL = True
 except ImportError:
     HAVE_PSUTIL = False
-    print("Missed psutil dependency: pip3 install -U psutil")
-
-try:
-    import pyzipper
-
-    HAVE_PYZIPPER = True
-except ImportError:
-    HAVE_PYZIPPER = False
-    print("Missed pyzipper dependency: pip3 install pyzipper -U")
+    print("Missed psutil dependency: poetry run pip install -U psutil")
 
 log = logging.getLogger(__name__)
+
+try:
+    zippwd = settings.ZIP_PWD
+except AttributeError:
+    zippwd = b"infected"
+
+try:
+    import re2 as re
+except ImportError:
+    import re
+
+HAVE_PLYARA = False
+with suppress(ImportError):
+    import plyara
+    import plyara.utils
+    HAVE_PLYARA = True
 
 # FORMAT = '%(asctime)-15s %(clientip)s %(user)-8s %(message)s'
 
 # Config variables
 repconf = Config("reporting")
 web_conf = Config("web")
+routing_conf = Config("routing")
+reporting_conf = Config("reporting")
+dist_conf = Config("distributed")
+
+zlib_compresion = False
+if repconf.compression.enabled:
+    from zlib import decompress
+
+    zlib_compresion = True
+
+USE_SEVENZIP = False
+SEVENZIP_PATH = reporting_conf.compression.sevenzippath.strip() or "/usr/bin/7z"
+if reporting_conf.compression.compressiontool.strip() == "7zip":
+    USE_SEVENZIP = True
+
 
 if repconf.mongodb.enabled:
-    import pymongo
-
-    results_db = pymongo.MongoClient(
-        settings.MONGO_HOST,
-        port=settings.MONGO_PORT,
-        username=settings.MONGO_USER,
-        password=settings.MONGO_PASS,
-        authSource=settings.MONGO_DB,
-    )[settings.MONGO_DB]
+    from dev_utils.mongodb import (
+        mongo_delete_data,
+        mongo_find,
+        mongo_find_one,
+        mongo_find_one_and_update,
+    )
 
 es_as_db = False
 if repconf.elasticsearchdb.enabled and not repconf.elasticsearchdb.searchonly:
-    from elasticsearch import Elasticsearch
-
-    es_as_db = True
-    baseidx = repconf.elasticsearchdb.index
-    fullidx = baseidx + "-*"
-    es = Elasticsearch(
-        hosts=[
-            {
-                "host": repconf.elasticsearchdb.host,
-                "port": repconf.elasticsearchdb.port,
-            }
-        ],
-        timeout=60,
+    from dev_utils.elasticsearchdb import (
+        elastic_handler,
+        get_analysis_index,
+        get_query_by_info_id,
     )
 
-db = Database()
+    es_as_db = True
+    es = elastic_handler
+
+
+DIST_ENABLED = False
+if dist_conf.distributed.enabled:
+    from lib.cuckoo.common.dist_db import Node, create_session
+    from lib.cuckoo.common.dist_db import Task as DTask
+
+    dist_session = create_session(
+        dist_conf.distributed.db,
+        echo=False,
+    )
+    DIST_ENABLED = True
+
+db: _Database = Database()
+
+ALLOWED_YARA_CATEGORIES = ("binaries", "urls", "memory", "CAPE", "macro", "monitor")
 
 # Conditional decorator for web authentication
-class conditional_login_required(object):
+class conditional_login_required:
     def __init__(self, dec, condition):
         self.decorator = dec
         self.condition = condition
@@ -163,7 +219,7 @@ def index(request):
                 parsed[key]["rps"] = "None"
                 parsed[key]["rpm"] = "None"
 
-    return render(request, "apiv2/index.html", {"config": parsed})
+    return render(request, "apiv2/index.html", {"title": "API", "config": parsed})
 
 
 @csrf_exempt
@@ -179,26 +235,39 @@ def tasks_create_static(request):
 
     options = request.data.get("options", "")
     priority = force_int(request.data.get("priority"))
+    attributes = request.data.get("attributes")
 
-    resp["error"] = False
+    resp["error"] = []
     files = request.FILES.getlist("file")
     extra_details = {}
-    task_ids = list()
+    task_ids = []
     for sample in files:
-        tmp_path = store_temp_file(sample.read(), sanitize_filename(sample.name))
-        try:
-            task_id, extra_details = db.demux_sample_and_add_to_db(
-                tmp_path, options=options, priority=priority, static=1, only_extraction=True, user_id=request.user.id or 0
-            )
-            task_ids.extend(task_id)
-        except CuckooDemuxError as e:
-            resp = {"error": True, "error_value": e}
-            return Response(resp)
+        with sample:
+            tmp_path = store_temp_file(sample.read(), sanitize_filename(sample.name))
+            try:
+                task_id, extra_details = db.demux_sample_and_add_to_db(
+                    tmp_path,
+                    options=options,
+                    priority=priority,
+                    static=1,
+                    only_extraction=True,
+                    user_id=request.user.id or 0,
+                    attributes=attributes,
+                )
+                task_ids.extend(task_id)
+                if extra_details.get("erros"):
+                    resp["errors"].extend(extra_details["errors"])
+            except CuckooDemuxError as e:
+                resp = {"error": True, "error_value": e}
+                return Response(resp)
 
     resp["data"] = {}
     resp["data"]["task_ids"] = task_ids
     if extra_details and "config" in extra_details:
         resp["data"]["config"] = extra_details["config"]
+    if extra_details.get("errors"):
+        resp["errors"].extend(extra_details["errors"])
+
     callback = apiconf.filecreate.get("status")
     if task_ids:
         if len(task_ids) == 1:
@@ -209,7 +278,7 @@ def tasks_create_static(request):
             resp["data"] = {}
             resp["data"]["message"] = "Task IDs {0} have been submitted".format(", ".join(str(x) for x in task_ids))
             if callback:
-                resp["url"] = list()
+                resp["url"] = []
                 for tid in task_ids:
                     resp["url"].append("{0}/submit/status/{1}".format(apiconf.api.get("url"), tid))
             else:
@@ -231,20 +300,31 @@ def tasks_create_file(request):
         if request.FILES.getlist("file") == []:
             resp = {"error": True, "error_value": "No file was submitted"}
             return Response(resp)
-        resp["error"] = False
+        resp["error"] = []
         # Parse potential POST options (see submission/views.py)
-        quarantine = request.data.get("quarantine", "")
         pcap = request.data.get("pcap", "")
-        unique = bool(request.data.get("unique", False))
-        static = request.data.get("static", "")
-        priority = force_int(request.data.get("priority"))
-        options = request.data.get("options", "")
-        machine = request.data.get("machine", "")
+        attributes = request.data.get("attributes")
 
-        if request.data.get("process_dump"):
-            if options:
-                options += ","
-            options += "procmemdump=1,procdump=1"
+        (
+            static,
+            package,
+            timeout,
+            priority,
+            options,
+            machine,
+            platform,
+            tags,
+            custom,
+            memory,
+            clock,
+            enforce_timeout,
+            unique,
+            referrer,
+            tlp,
+            tags_tasks,
+            route,
+            cape,
+        ) = parse_request_arguments(request, keyword="data")
 
         details = {
             "errors": [],
@@ -258,13 +338,14 @@ def tasks_create_file(request):
             "options": options,
             "only_extraction": False,
             "user_id": request.user.id or 0,
+            "attributes": attributes,
         }
 
-        task_ids_tmp = []
         task_machines = []
-        vm_list = []
-        for vm in db.list_machines():
-            vm_list.append(vm.label)
+        vm_list = [vm.label for vm in db.list_machines()]
+        explicit_vm_list = [
+            vm.label for vm in db.list_machines(include_reserved=True)
+        ]
 
         if machine.lower() == "all":
             if not apiconf.filecreate.get("allmachines"):
@@ -274,83 +355,69 @@ def tasks_create_file(request):
                 task_machines.append(entry)
         else:
             # Check if VM is in our machines table
-            if machine == "" or machine in vm_list:
+            if machine == "" or machine in explicit_vm_list:
                 task_machines.append(machine)
-            # Error if its not
             else:
                 resp = {
                     "error": True,
-                    "error_value": ("Machine '{0}' does not exist. " "Available: {1}".format(machine, ", ".join(vm_list))),
+                    "error_value": f"Machine '{machine}' does not exist. Available: {', '.join(explicit_vm_list)}",
                 }
                 return Response(resp)
-        # Parse a max file size to be uploaded
-        max_file_size = settings.MAX_UPLOAD_SIZE
-        if not max_file_size or int(max_file_size) == 0:
-            max_file_size = 5 * 1048576
-        else:
-            max_file_size = int(max_file_size) * 1048576
 
-        files = list()
+        files = []
         # Check if we are allowing multiple file submissions
         multifile = apiconf.filecreate.get("multifile")
         if multifile:
             files = request.FILES.getlist("file")
         else:
             files = [request.FILES.getlist("file")[0]]
-        # Handle all files
-        for sample in files:
-            if sample.size == 0:
-                resp = {"error": True, "error_value": "You submitted an empty file"}
-                return Response(resp)
-            if sample.size > max_file_size:
-                resp = {"error": True, "error_value": "File size exceeds API limit"}
-                return Response(resp)
-            tmp_path = store_temp_file(sample.read(), sanitize_filename(sample.name))
-            details["path"] = tmp_path
 
-            if (web_conf.uniq_submission.enabled or unique) and db.check_file_uniq(
-                File(tmp_path).get_sha256(), hours=web_conf.uniq_submission.hours
-            ):
-                details["errors"].append({sample.name: "Not unique, as unique option set on submit or in conf/web.conf"})
-                continue
+        opt_filename = get_user_filename(options, custom)
+        list_of_tasks, details = process_new_task_files(request, files, details, opt_filename, unique)
+
+        for content, tmp_path, _ in list_of_tasks:
             if pcap:
-                if sample.name.lower().endswith(".saz"):
+                if tmp_path.lower().endswith(b".saz"):
                     saz = saz_to_pcap(tmp_path)
                     if saz:
                         try:
-                            os.remove(tmp_path)
+                            parent_dir = os.path.dirname(tmp_path)
+                            path_delete(tmp_path)
+                            with suppress(OSError):
+                                os.rmdir(parent_dir)
                         except Exception as e:
                             print(e, "removing pcap")
                         tmp_path = saz
                     else:
-                        resp = {"error": True, "error_value": "Failed to convert SAZ to PCAP"}
-                        return Response(resp)
-                task_id = db.add_pcap(file_path=tmp_path)
+                        details["error"].append({os.path.basename(tmp_path): "Failed to convert SAZ to PCAP"})
+                        continue
+                task_id = db.add_pcap(
+                    file_path=tmp_path,
+                    user_id=details["user_id"],
+                    attributes=attributes,
+                )
                 details["task_ids"].append(task_id)
                 continue
             if static:
-                task_id = db.add_static(file_path=tmp_path, priority=priority, user_id=request.user.id or 0)
+                task_id = db.add_static(
+                    file_path=tmp_path,
+                    priority=priority,
+                    user_id=request.user.id or 0,
+                    attributes=attributes,
+                )
                 details["task_ids"].append(task_id)
                 continue
-            if quarantine:
-                path = unquarantine(tmp_path)
-                try:
-                    os.remove(tmp_path)
-                    tmp_path = path
-                except Exception as e:
-                    print(e, "removing quarantine")
-                try:
-                    File(path).get_type()
-                except TypeError:
-                    details["errors"].append({os.path.basename(tmp_path): "Error submitting file - bad file type"})
-                    continue
-            else:
-                details["content"] = get_file_content(tmp_path)
-                status, task_ids_tmp = download_file(**details)
+            if tmp_path:
+                details["path"] = tmp_path
+                details["content"] = content
+
+                status, tasks_details = download_file(**details)
                 if status == "error":
-                    details["errors"].append({os.path.basename(tmp_path): task_ids_tmp})
+                    details["errors"].append({os.path.basename(tmp_path).decode(): tasks_details})
                 else:
-                    details["task_ids"] = task_ids_tmp
+                    details["task_ids"] = tasks_details.get("task_ids")
+                    if tasks_details.get("errors"):
+                        details["errors"].extend(tasks_details["errors"])
 
         if details["task_ids"]:
             tasks_count = len(details["task_ids"])
@@ -366,9 +433,11 @@ def tasks_create_file(request):
                 if callback:
                     resp["url"] = ["{0}/submit/status/{1}/".format(apiconf.api.get("url"), details.get("task_ids", [])[0])]
             else:
-                resp["data"]["message"] = "Task IDs {0} have been submitted".format(", ".join(str(x) for x in details.get("task_ids", [])))
+                resp["data"]["message"] = "Task IDs {0} have been submitted".format(
+                    ", ".join(str(x) for x in details.get("task_ids", []))
+                )
                 if callback:
-                    resp["url"] = list()
+                    resp["url"] = []
                     for tid in details.get("task_ids", []):
                         resp["url"].append("{0}/submit/status/{1}".format(apiconf.api.get("url"), tid))
         else:
@@ -386,9 +455,10 @@ def tasks_create_url(request):
 
     resp = {}
     if request.method == "POST":
-        resp["error"] = False
+        resp["error"] = []
 
-        url = request.data.get("url", None)
+        url = request.data.get("url")
+        attributes = request.data.get("attributes")
         (
             static,
             package,
@@ -402,23 +472,20 @@ def tasks_create_url(request):
             memory,
             clock,
             enforce_timeout,
-            shrike_url,
-            shrike_msg,
-            shrike_sid,
-            shrike_refer,
             unique,
             referrer,
             tlp,
             tags_tasks,
             route,
             cape,
-        ) = parse_request_arguments(request)
+        ) = parse_request_arguments(request, keyword="data")
 
         task_ids = []
         task_machines = []
-        vm_list = []
-        for vm in db.list_machines():
-            vm_list.append(vm.label)
+        vm_list = [vm.label for vm in db.list_machines()]
+        explicit_vm_list = [
+            vm.label for vm in db.list_machines(include_reserved=True)
+        ]
 
         if not url:
             resp = {"error": True, "error_value": "URL value is empty"}
@@ -432,13 +499,13 @@ def tasks_create_url(request):
                 task_machines.append(entry)
         else:
             # Check if VM is in our machines table
-            if machine == "" or machine in vm_list:
+            if machine == "" or machine in explicit_vm_list:
                 task_machines.append(machine)
             # Error if its not
             else:
                 resp = {
                     "error": True,
-                    "error_value": ("Machine '{0}' does not exist. " "Available: {1}".format(machine, ", ".join(vm_list))),
+                    "error_value": "Machine '{0}' does not exist. Available: {1}".format(machine, ", ".join(explicit_vm_list)),
                 }
                 return Response(resp)
 
@@ -461,15 +528,12 @@ def tasks_create_url(request):
                 memory=memory,
                 enforce_timeout=enforce_timeout,
                 clock=clock,
-                shrike_url=shrike_url,
-                shrike_msg=shrike_msg,
-                shrike_sid=shrike_sid,
-                shrike_refer=shrike_refer,
                 route=route,
                 cape=cape,
                 tlp=tlp,
                 tags_tasks=tags_tasks,
                 user_id=request.user.id or 0,
+                attributes=attributes,
             )
             if task_id:
                 task_ids.append(task_id)
@@ -497,22 +561,40 @@ def tasks_create_dlnexec(request):
             resp = {"error": True, "error_value": "DL&Exec Create API is Disabled"}
             return Response(resp)
 
-        resp["error"] = False
-        url = request.data.get("dlnexec", None)
+        resp["error"] = []
+        url = request.data.get("dlnexec")
         if not url:
             resp = {"error": True, "error_value": "URL value is empty"}
             return Response(resp)
+        attributes = request.data.get("attributes")
 
-        options = request.data.get("options", "")
-        custom = request.data.get("custom", "")
-        machine = request.data.get("machine", "")
-        referrer = validate_referrer(request.data.get("referrer", None))
+        (
+            static,
+            package,
+            timeout,
+            priority,
+            options,
+            machine,
+            platform,
+            tags,
+            custom,
+            memory,
+            clock,
+            enforce_timeout,
+            unique,
+            referrer,
+            tlp,
+            tags_tasks,
+            route,
+            cape,
+        ) = parse_request_arguments(request, keyword="data")
 
         details = {}
         task_machines = []
-        vm_list = []
-        for vm in db.list_machines():
-            vm_list.append(vm.label)
+        vm_list = [vm.label for vm in db.list_machines()]
+        explicit_vm_list = [
+            vm.label for vm in db.list_machines(include_reserved=True)
+        ]
 
         if machine.lower() == "all":
             if not apiconf.dlnexeccreate.get("allmachines"):
@@ -522,30 +604,23 @@ def tasks_create_dlnexec(request):
                 task_machines.append(entry)
         else:
             # Check if VM is in our machines table
-            if machine == "" or machine in vm_list:
+            if machine == "" or machine in explicit_vm_list:
                 task_machines.append(machine)
             # Error if its not
             else:
-                resp = {"error": True, "error_value": ("Machine '{0}' does not exist. Available: {1}".format(machine, ", ".join(vm_list)))}
+                resp = {
+                    "error": True,
+                    "error_value": "Machine '{0}' does not exist. Available: {1}".format(
+                        machine,
+                        ", ".join(explicit_vm_list),
+                    ),
+                }
                 return Response(resp)
 
-        if referrer:
-            if options:
-                options += ","
-            options += "referrer=%s" % (referrer)
-
-        url = url.replace("hxxps://", "https://").replace("hxxp://", "http://").replace("[.]", ".")
-        response = _download_file(request.data.get("route", None), url, options)
-        if not response:
+        path, content, _ = process_new_dlnexec_task(url, route, options, custom)
+        if not path:
             return Response({"error": "Was impossible to retrieve url"})
 
-        name = os.path.basename(url)
-        if not "." in name:
-            name = get_user_filename(options, custom) or generate_fake_name()
-
-        path = store_temp_file(response, name)
-
-        content = get_file_content(path)
         details = {
             "errors": [],
             "content": content,
@@ -560,13 +635,16 @@ def tasks_create_dlnexec(request):
             "options": options,
             "only_extraction": False,
             "user_id": request.user.id or 0,
+            "attributes": attributes,
         }
 
-        status, task_ids_tmp = download_file(**details)
+        status, tasks_details = download_file(**details)
         if status == "error":
-            details["errors"].append({os.path.basename(path): task_ids_tmp})
+            details["errors"].append({os.path.basename(path).decode(): tasks_details})
         else:
-            details["task_ids"] = task_ids_tmp
+            details["task_ids"] = tasks_details.get("task_ids")
+            if tasks_details.get("errors"):
+                details["errors"].extend(tasks_details["errors"])
 
         if details["task_ids"]:
             tasks_count = len(details["task_ids"])
@@ -579,107 +657,9 @@ def tasks_create_dlnexec(request):
             if len(details.get("task_ids")) == 1:
                 resp["data"]["message"] = "Task ID {0} has been submitted".format(str(details.get("task_ids", [])[0]))
             else:
-                resp["data"]["message"] = "Task IDs {0} have been submitted".format(", ".join(str(x) for x in details.get("task_ids", [])))
-        else:
-            resp = {"error": True, "error_value": "Error adding task to database", "errors": details["errors"]}
-    else:
-        resp = {"error": True, "error_value": "Method not allowed"}
-
-    return Response(resp)
-
-
-# Download a file from VT for analysis
-@csrf_exempt
-@api_view(["POST"])
-def tasks_vtdl(request):
-    resp = {}
-    if request.method == "POST":
-        # Check if this API function is enabled
-        if not apiconf.vtdl.get("enabled"):
-            resp = {"error": True, "error_value": "VTDL Create API is Disabled"}
-            return Response(resp)
-
-        hashes = request.data.get("vtdl".strip(), None)
-        if not hashes:
-            hashes = request.data.get("hashes".strip(), None)
-
-        if not hashes:
-            resp = {"error": True, "error_value": "vtdl (hash list) value is empty"}
-            return Response(resp)
-
-        resp["error"] = False
-        options = request.data.get("options", "")
-        custom = request.data.get("custom", "")
-        machine = request.data.get("machine", "")
-
-        opt_filename = get_user_filename(options, custom)
-
-        task_machines = []
-        vm_list = []
-        opt_apikey = False
-        opts = get_options(options)
-        if opts:
-            opt_apikey = opts.get("apikey", False)
-
-        if not (settings.VTDL_KEY or opt_apikey) or not settings.VTDL_PATH:
-            resp = {
-                "error": True,
-                "error_value": "You specified VirusTotal but must edit the file and specify your VTDL_KEY variable and VTDL_PATH base directory",
-            }
-            return Response(resp)
-
-        for vm in db.list_machines():
-            vm_list.append(vm.label)
-
-        if machine.lower() == "all":
-            if not apiconf.filecreate.get("allmachines"):
-                resp = {"error": True, "error_value": "Machine=all is disabled using the API"}
-                return Response(resp)
-            for entry in vm_list:
-                task_machines.append(entry)
-        else:
-            # Check if VM is in our machines table
-            if machine == "" or machine in vm_list:
-                task_machines.append(machine)
-            # Error if its not
-            else:
-                resp = {
-                    "error": True,
-                    "error_value": ("Machine '{0}' does not exist. " "Available: {1}".format(machine, ", ".join(vm_list))),
-                }
-                return Response(resp)
-
-        details = {
-            "apikey": settings.VTDL_KEY or opt_apikey,
-            "errors": [],
-            "content": False,
-            "request": request,
-            "task_ids": [],
-            "url": False,
-            "params": {},
-            "headers": {},
-            "service": "VirusTotal",
-            "path": "",
-            "fhash": False,
-            "options": options,
-            "only_extraction": False,
-            "user_id": request.user.id or 0,
-        }
-
-        details = download_from_vt(hashes, details, opt_filename, settings)
-
-        if details["task_ids"]:
-            tasks_count = len(details["task_ids"])
-        else:
-            tasks_count = 0
-        if tasks_count > 0:
-            resp["data"] = {}
-            resp["errors"] = details["errors"]
-            resp["data"]["task_ids"] = details["task_ids"]
-            if len(details["task_ids"]) == 1:
-                resp["data"]["message"] = "Task ID {0} has been submitted".format(str(details["task_ids"][0]))
-            else:
-                resp["data"]["message"] = "Task IDs {0} have been submitted".format(", ".join(str(x) for x in details["task_ids"]))
+                resp["data"]["message"] = "Task IDs {0} have been submitted".format(
+                    ", ".join(str(x) for x in details.get("task_ids", []))
+                )
         else:
             resp = {"error": True, "error_value": "Error adding task to database", "errors": details["errors"]}
     else:
@@ -692,14 +672,20 @@ def tasks_vtdl(request):
 @csrf_exempt
 @api_view(["GET"])
 def files_view(request, md5=None, sha1=None, sha256=None, sample_id=None):
-
     if not apiconf.fileview.get("enabled"):
         resp = {"error": True, "error_value": "File View API is Disabled"}
         return Response(resp)
 
     resp = {}
     if md5 or sha1 or sha256 or sample_id:
-        resp["error"] = False
+        resp["error"] = []
+        """
+        for key, value in (("md5", md5), ("sha1", sha1), ("sha256", sha256), ("id", sample_id)):
+            if value:
+                if not apiconf.fileview.get(key):
+                    resp = {"error": True, "error_value": f"File View by {key.upper()} is Disabled"}
+                    return Response(resp)
+        """
         if md5:
             if not apiconf.fileview.get("md5"):
                 resp = {"error": True, "error_value": "File View by MD5 is Disabled"}
@@ -743,7 +729,7 @@ def tasks_search(request, md5=None, sha1=None, sha256=None):
         return Response(resp)
 
     if md5 or sha1 or sha256:
-        resp["error"] = False
+        resp["error"] = []
         if md5:
             if not apiconf.tasksearch.get("md5"):
                 resp = {"error": True, "error_value": "Task Search by MD5 is Disabled"}
@@ -768,13 +754,15 @@ def tasks_search(request, md5=None, sha1=None, sha256=None):
                 sids = [tmp_sample.to_dict()["id"] for tmp_sample in samples]
             else:
                 sids = [sample.to_dict()["id"]]
-            resp["data"] = list()
+            resp["data"] = []
             for sid in sids:
-                tasks = db.list_tasks(sample_id=sid)
+                tasks = db.list_tasks(sample_id=sid, include_hashes=True)
                 for task in tasks:
                     buf = task.to_dict()
                     # Remove path information, just grab the file name
-                    buf["target"] = buf["target"].split("/")[-1]
+                    buf["target"] = buf["target"].rsplit("/", 1)[-1]
+                    if task.sample:
+                        buf["sample"] = task.sample.to_dict()
                     resp["data"].append(buf)
         else:
             resp = {"data": [], "error": False}
@@ -782,6 +770,7 @@ def tasks_search(request, md5=None, sha1=None, sha256=None):
     return Response(resp)
 
 
+# ToDo requires proper review and rewrite
 # Return Task ID's and data that match a hash.
 @csrf_exempt
 @api_view(["POST"])
@@ -792,23 +781,29 @@ def ext_tasks_search(request):
         resp = {"error": True, "error_value": "Extended Task Search API is Disabled"}
         return Response(resp)
 
-    return_data = list()
+    return_data = []
     term = request.data.get("option", "")
     value = request.data.get("argument", "")
+    search_limit = request.data.get("search_limit", 50)
 
     if term and value:
         records = False
-        if not term in search_term_map.keys() and term not in ("malscore", "ttp"):
+        if term not in search_term_map and term not in ("malscore", "ttp"):
             resp = {"error": True, "error_value": "Invalid Option. '%s' is not a valid option." % term}
             return Response(resp)
 
-        if term in ("ids", "options", "tags_tasks"):
+        if term == "tags_tasks":
+            value = [int(v.id) for v in db.list_tasks(tags_tasks_like=value, limit=int(search_limit))]
+            term = "ids"
+        elif term == "options":
+            value = [int(v.id) for v in db.list_tasks(options_like=value, limit=search_limit)]
+            term = "ids"
+        elif term == "ids":
             if all([v.strip().isdigit() for v in value.split(",")]):
                 value = [int(v.strip()) for v in filter(None, value.split(","))]
             else:
                 return Response({"error": True, "error_value": "Not all values are integers"})
-        if term == "ids":
-            tmp_value = list()
+            tmp_value = []
             for task in db.list_tasks(task_ids=value) or []:
                 if task.status == "reported":
                     tmp_value.append(task.id)
@@ -816,14 +811,9 @@ def ext_tasks_search(request):
                     return_data.append({"analysis": {"status": task.status, "id": task.id}})
             value = tmp_value
             del tmp_value
-
         try:
-            if term == "malscore":
-                records = perform_malscore_search(value)
-            elif term == "ttp":
-                records = perform_ttps_search(value)
-            else:
-                records = perform_search(term, value)
+            projection = lean_search_filters if request.data.get("lean") else None
+            records = perform_search(term, value, user_id=request.user.id, privs=request.user.is_staff, web=False, projection=projection)
         except ValueError:
             if not term:
                 resp = {"error": True, "error_value": "No option provided."}
@@ -860,8 +850,7 @@ def ext_tasks_search(request):
 @csrf_exempt
 @api_view(["GET"])
 def tasks_list(request, offset=None, limit=None, window=None):
-
-    if not apiconf.tasklist.get("enabled", None):
+    if not apiconf.tasklist.get("enabled"):
         resp = {"error": True, "error_value": "Task List API is Disabled"}
         return Response(resp)
 
@@ -874,6 +863,7 @@ def tasks_list(request, offset=None, limit=None, window=None):
         limit = int(apiconf.tasklist.get("maxlimit"))
 
     completed_after = request.query_params.get("completed_after")
+    ids_only = request.query_params.get("ids")
     if completed_after:
         completed_after = datetime.fromtimestamp(int(completed_after))
 
@@ -887,41 +877,52 @@ def tasks_list(request, offset=None, limit=None, window=None):
 
     status = request.query_params.get("status")
     option = request.query_params.get("option")
+    category = request.query_params.get("category")
 
     if offset:
         offset = int(offset)
-    resp["data"] = list()
+    resp["data"] = []
     resp["config"] = "Limit: {0}, Offset: {1}".format(limit, offset)
     resp["buf"] = 0
 
-    for row in db.list_tasks(
+    tasks = db.list_tasks(
         limit=limit,
         details=True,
+        category=category,
         offset=offset,
         completed_after=completed_after,
         status=status,
         options_like=option,
         order_by=Task.completed_on.desc(),
-    ):
-        resp["buf"] += 1
-        task = row.to_dict()
-        task["guest"] = {}
-        if row.guest:
-            task["guest"] = row.guest.to_dict()
+        include_hashes=True,
+    )
 
-        task["errors"] = []
-        for error in row.errors:
-            task["errors"].append(error.message)
+    if not tasks:
+        return Response(resp)
 
-        task["sample"] = {}
-        if row.sample_id:
-            sample = db.view_sample(row.sample_id)
-            task["sample"] = sample.to_dict()
+    # Dist.py fetches only ids
+    if ids_only:
+        resp["data"] = [{"id": task.id} for task in tasks]
+    else:
+        for row in tasks:
+            resp["buf"] += 1
+            task = row.to_dict()
+            task["guest"] = {}
+            if row.guest:
+                task["guest"] = row.guest.to_dict()
 
-        if task["target"]:
-            task["target"] = convert_to_printable(task["target"])
+            task["errors"] = []
+            for error in row.errors:
+                task["errors"].append(error.message)
 
-        resp["data"].append(task)
+            task["sample"] = {}
+            if row.sample:
+                task["sample"] = row.sample.to_dict()
+
+            if task.get("target"):
+                task["target"] = convert_to_printable(task["target"])
+
+            resp["data"].append(task)
 
     return Response(resp)
 
@@ -929,42 +930,150 @@ def tasks_list(request, offset=None, limit=None, window=None):
 @csrf_exempt
 @api_view(["GET"])
 def tasks_view(request, task_id):
-
     if not apiconf.taskview.get("enabled"):
         resp = {"error": True, "error_value": "Task View API is Disabled"}
         return Response(resp)
 
-    resp = {}
     task = db.view_task(task_id, details=True)
-    resp["error"] = False
-    if task:
-        entry = task.to_dict()
-        if entry["category"] != "url":
-            entry["target"] = entry["target"].split("/")[-1]
-        entry["guest"] = {}
-        if task.guest:
-            entry["guest"] = task.guest.to_dict()
-
-        entry["errors"] = []
-        for error in task.errors:
-            entry["errors"].append(error.message)
-
-        entry["sample"] = {}
-        if task.sample_id:
-            sample = db.view_sample(task.sample_id)
-            entry["sample"] = sample.to_dict()
-
-        resp["data"] = entry
-    else:
+    if not task:
         resp = {"error": True, "error_value": "Task not found in database"}
+        return Response(resp)
 
+    resp = {"error": False}
+    entry = task.to_dict()
+    if entry["category"] != "url":
+        entry["target"] = entry["target"].rsplit("/", 1)[-1]
+    entry["guest"] = {}
+    if task.guest:
+        entry["guest"] = task.guest.to_dict()
+
+    entry["errors"] = []
+    for error in task.errors:
+        entry["errors"].append(error.message)
+
+    entry["sample"] = {}
+    if task.sample_id:
+        sample = db.view_sample(task.sample_id)
+        entry["sample"] = sample.to_dict()
+
+    if task.status == TASK_RECOVERED and task.custom:
+        m = re.match(r"^Recovery_(?P<taskid>\d+)$", task.custom)
+        if m:
+            task_id = int(m.group("taskid"))
+            task = db.view_task(task_id, details=True)
+            resp["error"] = []
+            if task:
+                entry = task.to_dict()
+                if entry["category"] != "url":
+                    entry["target"] = entry["target"].rsplit("/", 1)[-1]
+                    entry["guest"] = {}
+                if task.guest:
+                    entry["guest"] = task.guest.to_dict()
+                entry["errors"] = []
+                for error in task.errors:
+                    entry["errors"].append(error.message)
+                entry["sample"] = {}
+                if task.sample_id:
+                    sample = db.view_sample(task.sample_id)
+                    entry["sample"] = sample.to_dict()
+
+    if repconf.mongodb.enabled:
+        rtmp = mongo_find_one(
+            "analysis",
+            {"info.id": int(task.id)},
+            {
+                "info": 1,
+                "virustotal_summary": 1,
+                "malscore": 1,
+                "detections": 1,
+                "network.pcap_sha256": 1,
+                "mlist_cnt": 1,
+                "f_mlist_cnt": 1,
+                "target.file.clamav": 1,
+                "suri_tls_cnt": 1,
+                "suri_alert_cnt": 1,
+                "suri_http_cnt": 1,
+                "suri_file_cnt": 1,
+                "trid": 1,
+                "_id": 0,
+            },
+            sort=[("_id", -1)],
+        )
+
+    rtmp = None
+    if es_as_db:
+        rtmp = es.search(
+            index=get_analysis_index(),
+            query=get_query_by_info_id(str(task.id)),
+            _source=[
+                "info",
+                "virustotal_summary",
+                "malscore",
+                "detections",
+                "network.pcap_sha256",
+                "mlist_cnt",
+                "f_mlist_cnt",
+                "target.file.clamav",
+                "suri_tls_cnt",
+                "suri_alert_cnt",
+                "suri_http_cnt",
+                "suri_file_cnt",
+                "trid",
+            ],
+        )["hits"]["hits"]
+        if len(rtmp) > 1:
+            rtmp = rtmp[-1]["_source"]
+        elif len(rtmp) == 1:
+            rtmp = rtmp[0]["_source"]
+        else:
+            pass
+
+    if rtmp:
+        for keyword in (
+            "detections",
+            "virustotal_summary",
+            "mlist_cnt",
+            "f_mlist_cnt",
+            "suri_tls_cnt",
+            "suri_alert_cnt",
+            "suri_file_cnt",
+            "suri_http_cnt",
+            "mlist_cnt",
+            "f_mlist_cnt",
+            "malscore",
+        ):
+            if keyword in rtmp:
+                entry[keyword] = rtmp[keyword]
+
+        if "info" in rtmp:
+            for keyword in ("custom", "package"):
+                if rtmp["info"].get(keyword, False):
+                    entry[keyword] = rtmp["info"][keyword]
+
+        if "network" in rtmp and "pcap_sha256" in rtmp["network"]:
+            entry["pcap_sha256"] = rtmp["network"]["pcap_sha256"]
+
+        if rtmp.get("target", {}).get("file", False):
+            for keyword in ("clamav", "trid"):
+                if rtmp["info"].get(keyword, False):
+                    entry[keyword] = rtmp["info"]["target"][keyword]
+
+        if settings.MOLOCH_ENABLED:
+            if settings.MOLOCH_BASE[-1] != "/":
+                settings.MOLOCH_BASE += "/"
+            entry["moloch_url"] = (
+                settings.MOLOCH_BASE
+                + "?date=-1&expression=tags"
+                + quote("\x3d\x3d\x22%s\x3a%s\x22" % (settings.MOLOCH_NODE, task.id), safe="")
+            )
+
+    resp["data"] = entry
     return Response(resp)
 
 
 @csrf_exempt
 @api_view(["GET"])
 def tasks_reschedule(request, task_id):
-
     if not apiconf.taskresched.get("enabled"):
         resp = {"error": True, "error_value": "Task Reschedule API is Disabled"}
         return Response(resp)
@@ -974,21 +1083,43 @@ def tasks_reschedule(request, task_id):
         return Response(resp)
 
     resp = {}
-    if db.reschedule(task_id):
-        resp["error"] = False
-        resp["data"] = "Task ID {0} has been rescheduled".format(task_id)
+    new_task_id = db.reschedule(task_id)
+    if new_task_id:
+        resp["error"] = []
+        resp["data"] = {}
+        resp["data"]["new_task_id"] = new_task_id
+        resp["data"]["message"] = "Task ID {0} has been rescheduled".format(task_id)
     else:
-        resp = {"error": True, "error_value": ("An error occured while trying to reschedule " "Task ID {0}".format(task_id))}
+        resp = {
+            "error": True,
+            "error_value": "An error occurred while trying to reschedule Task ID {0}".format(task_id),
+        }
 
     return Response(resp)
 
 
 @csrf_exempt
 @api_view(["GET"])
-def tasks_delete(request, task_id):
+def tasks_reprocess(request, task_id):
+    resp = {}
+    if not apiconf.taskreprocess.get("enabled"):
+        resp["error"] = True
+        resp["error_value"] = "Task Reprocess API is Disabled"
+        return Response(resp)
+
+    error, msg, task_status = db.tasks_reprocess(task_id)
+    if error:
+        return Response({"error": True, "error_value": msg})
+
+    return Response({"error": error, "data": f"Task ID {task_id} with status {task_status} marked for reprocessing"})
+
+
+@csrf_exempt
+@api_view(["GET"])
+def tasks_delete(request, task_id, status=False):
     """
     task_id: int or string if many
-    example: 1 or 1,2,3,4
+    example: 1 or 1,2,3,4 or 1-4
 
     """
     if not (apiconf.taskdelete.get("enabled") or request.user.is_staff):
@@ -997,26 +1128,33 @@ def tasks_delete(request, task_id):
 
     if isinstance(task_id, int):
         task_id = [task_id]
+    elif "-" in task_id:
+        start, end = map(force_int, task_id.split("-"))
+        if start > end:
+            resp = {"error": True, "error_value": "Start Task ID is bigger than End Task ID"}
+            return Response(resp)
+        else:
+            task_id = list(range(start, end + 1))
     else:
-        task_id = [task.strip() for task in task_id.split(",")]
+        task_id = [force_int(task.strip()) for task in task_id.split(",")]
 
     resp = {}
-    s_deleted = list()
-    f_deleted = list()
+    s_deleted = []
+    f_deleted = []
     for task in task_id:
-        check = validate_task(task)
+        check = validate_task(task, status)
         if check["error"]:
-            f_deleted.append(task)
+            f_deleted.append(str(task))
             continue
 
-        # ToDo missed mongo?
         if db.delete_task(task):
             delete_folder(os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task))
-            delete_mongo_data(task)
+            if web_conf.web_reporting.get("enabled", True):
+                mongo_delete_data(task)
 
-            s_deleted.append(task)
+            s_deleted.append(str(task))
         else:
-            f_deleted.append(task)
+            f_deleted.append(str(task))
 
     if s_deleted:
         resp["data"] = "Task(s) ID(s) {0} has been deleted".format(",".join(s_deleted))
@@ -1028,43 +1166,99 @@ def tasks_delete(request, task_id):
     return Response(resp)
 
 
+# Re-enable session-cookie auth so the in-browser "End Session" button works
+# under SSO deployments where the global DRF chain is API-key-only.
 @csrf_exempt
-@api_view(["GET"])
+@api_view(["GET", "POST"])
 def tasks_status(request, task_id):
-
     if not apiconf.taskstatus.get("enabled"):
         resp = {"error": True, "error_value": "Task status API is disabled"}
         return Response(resp)
 
-    status = db.view_task(task_id).to_dict()["status"]
-    if not status:
-        resp = {"error": True, "error_value": "Task does not exist"}
+    resp = {}
+    if request.method == "POST":
+        try:
+            task = db.view_task(task_id, details=True)
+        except TypeError:
+            task = db.view_task(task_id)
     else:
+        task = db.view_task(task_id)
+    if not task:
+        resp = {"error": True, "error_value": "Task does not exist"}
+        return Response(resp)
+    if request.method == "GET":
+        status = task.to_dict()["status"]
         resp = {"error": False, "data": status}
-
+    elif request.method == "POST":
+        requested_status = request.data.get("status", "")
+        static_preview_cfg = getattr(web_conf, "static_preview", None)
+        web_allow_stop = bool(static_preview_cfg.get("allow_stop", True)) if (static_preview_cfg and hasattr(static_preview_cfg, "get")) else True
+        if requested_status == "stop" and (apiconf.user_stop.enabled or web_allow_stop):
+            resp = stop_analysis_task(task_id, mode="stop")
+        elif requested_status == "finish" and apiconf.user_stop.enabled:
+            guest = getattr(task, "guest", None)
+            if task.status != TASK_RUNNING or guest is None or not getattr(guest, "name", None):
+                resp = {"error": True, "error_value": "Task is not running"}
+                return Response(resp)
+            machine = db.view_machine(guest.name)
+            if machine and machine.status == "running":
+                try:
+                    guest_env = requests.get(f"http://{machine.ip}:8000/environ").json()
+                    complete_folder = hashlib.md5(f"cape-{task_id}".encode()).hexdigest()
+                    if machine.platform == "windows":
+                        dest_folder = f"{guest_env['environ']['TMP']}\\{complete_folder}"
+                    elif machine.platform == "linux":
+                        dest_folder = f"{guest_env['environ'].get('TMP', '/tmp')}/{complete_folder}"
+                    r = requests.post(f"http://{machine.ip}:8000/mkdir", data={"dirpath": dest_folder})
+                    resp = {"error": r.status_code != 200, "data": r.text}
+                except requests.exceptions.ConnectionError as e:
+                    log.error(e)
+                    resp = {"error": True, "error_value": str(e)}
     return Response(resp)
 
 
 @csrf_exempt
 @api_view(["GET"])
-def tasks_report(request, task_id, report_format="json"):
-
+def tasks_report(request, task_id, report_format="json", make_zip=False):
     if not apiconf.taskreport.get("enabled"):
-        resp = {"error": True, "error_value": "Task Deletion API is Disabled"}
+        resp = {"error": True, "error_value": "Task Report API is Disabled"}
         return Response(resp)
+
+    allow_dl = False
+    if hasattr(request.user, "userprofile") and request.user.userprofile.reports:
+        allow_dl = True
+    # check if allowed to download to all + if no if user has permissions
+    if not settings.ALLOW_DL_REPORTS_TO_ALL and allow_dl is False:
+        return render(
+            request,
+            "error.html",
+            {"error": "You don't have permissions to download reports. Ask admin to enable it for you in user profile."},
+        )
 
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
 
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
     resp = {}
+
     srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "reports")
+    if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found {os.path.basename(srcdir)}"})
 
     # Report validity check
-    if os.path.exists(srcdir) and len(os.listdir(srcdir)) == 0:
+    if path_exists(srcdir) and len(os.listdir(srcdir)) == 0:
         resp = {"error": True, "error_value": "No reports created for task %s" % task_id}
 
     formats = {
+        "protobuf": "report.protobuf",
         "json": "report.json",
         "html": "report.html",
         "htmlsummary": "summary-report.html",
@@ -1072,24 +1266,53 @@ def tasks_report(request, task_id, report_format="json"):
         "maec": "report.maec-4.1.xml",
         "maec5": "report.maec-5.0.json",
         "metadata": "report.metadata.xml",
+        "litereport": "lite.json",
+        "parti": "report.parti",
     }
 
-    bz_formats = {
-        "all": {"type": "-", "files": ["memory.dmp"]},
+    report_formats = {
+        # Use the 'all' option if you want all generated files except for memory.dmp and derived pcaps
+        "all": {
+            "type": "-",
+            "files": [
+                "memory.dmp",
+                "dump.pcapng",
+                "dump_decrypted.pcap",
+                "dump_mixed.pcap",
+                "dump_mixed_sorted.pcap",
+                "dump_sorted.pcap",
+            ],
+        },
+        # Use the 'dropped' option if you want all dropped files found in the /files directory
         "dropped": {"type": "+", "files": ["files"]},
-        "dist": {"type": "-", "files": ["binary", "dump_sorted.pcap", "memory.dmp"]},
-    }
-
-    tar_formats = {
-        "bz2": "w:bz2",
-        "gz": "w:gz",
-        "tar": "w",
+        # Use the 'dist' option if you want all generated files except for binary, dump_sorted.pcap, memory.dmp, and
+        # those found in the /logs directory
+        "dist": {"type": "-", "files": ["binary", "dump_sorted.pcap", "memory.dmp", "logs"]},
+        #  Use the 'lite' option if you want the generated files files.json, dump.pcap, and those found
+        # in the /CAPE, /files, /procdump, /macros and /shots directories
+        "lite": {
+            "type": "+",
+            "files": [
+                "files.json",
+                "CAPE",
+                "files",
+                "procdump",
+                "macros",
+                "shots",
+                "dump.pcap",
+                "selfextracted",
+                "evtx",
+                "tlsdump",
+            ],
+        },
     }
 
     if report_format.lower() in formats:
-        report_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "reports", formats[report_format.lower()])
-        if os.path.exists(report_path):
-            if report_format in ("json", "maec5"):
+        report_path = os.path.join(srcdir, formats[report_format.lower()])
+        if not os.path.normpath(report_path).startswith(ANALYSIS_BASE_PATH):
+            return render(request, "error.html", {"error": f"File not found {os.path.basename(report_path)}"})
+        if path_exists(report_path):
+            if report_format in ("litereport", "json", "maec5"):
                 content = "application/json; charset=UTF-8"
                 ext = "json"
             elif report_format.startswith("html"):
@@ -1101,59 +1324,87 @@ def tasks_report(request, task_id, report_format="json"):
             elif report_format == "pdf":
                 content = "application/pdf"
                 ext = "pdf"
+            elif report_format == "protobuf":
+                content = "application/octet-stream"
+                ext = "protobuf"
+            elif report_format == "parti":
+                ext = "parti"
+                content = "application/zip"
             fname = "%s_report.%s" % (task_id, ext)
-            resp = StreamingHttpResponse(FileWrapper(open(report_path, "rb"), 8096), content_type=content or "application/octet-stream;")
-            resp["Content-Length"] = os.path.getsize(report_path)
-            resp["Content-Disposition"] = "attachment; filename=" + fname
+
+            if make_zip:
+                if os.path.exists(report_path + ".zip"):
+                    report_path += ".zip"
+                    resp = StreamingHttpResponse(
+                        FileWrapper(open(report_path, "rb"), 8096), content_type="application/zip"
+                    )
+                    resp["Content-Length"] = os.path.getsize(report_path)
+                    resp["Content-Disposition"] = "attachment; filename=" + fname
+                else:
+                    mem_zip = create_zip(files=report_path)
+                    if mem_zip is False:
+                        resp = {"error": True, "error_value": "Can't create zip archive for report file"}
+                        return Response(resp)
+
+                    resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
+                    resp["Content-Length"] = len(mem_zip.getvalue())
+                    resp["Content-Disposition"] = f"attachment; filename={report_format}.zip"
+            else:
+                resp = StreamingHttpResponse(
+                    FileWrapper(open(report_path, "rb"), 8096), content_type=content or "application/octet-stream;"
+                )
+                resp["Content-Length"] = os.path.getsize(report_path)
+                resp["Content-Disposition"] = "attachment; filename=" + fname
+
             return resp
 
         else:
             resp = {"error": True, "error_value": "Reports directory does not exist"}
             return Response(resp)
 
-    elif report_format.lower() == "all":
-        if not apiconf.taskreport.get("all"):
-            resp = {"error": True, "error_value": "Downloading all reports in one call is disabled"}
-            return Response(resp)
+    elif report_format.lower() in report_formats:
+        if report_format.lower() == "all":
+            if not apiconf.taskreport.get("all"):
+                resp = {"error": True, "error_value": "Downloading all reports in one call is disabled"}
+                return Response(resp)
 
-        fname = "%s_reports.tar.bz2" % task_id
-        s = BytesIO()
-        tar = tarfile.open(name=fname, fileobj=s, mode="w:bz2")
-        for rep in os.listdir(srcdir):
-            tar.add(os.path.join(srcdir, rep), arcname=rep)
-        tar.close()
-        s.seek(0)
-        resp = StreamingHttpResponse(s, content_type="application/octet-stream;")
-        resp["Content-Length"] = str(len(s.getvalue()))
-        resp["Content-Disposition"] = "attachment; filename=" + fname
-        return resp
-
-    elif report_format.lower() in bz_formats:
-        bzf = bz_formats[report_format.lower()]
+        report_files = report_formats[report_format.lower()]
         srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id))
-        s = BytesIO()
+        if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH) and path_exists(srcdir):
+            return render(request, "error.html", {"error": f"File not found {os.path.basename(srcdir)}"})
 
-        # By default go for bz2 encoded tar files (for legacy reasons.)
-        # tarmode = tar_formats.get("tar", "w:bz2")
+        mem_zip = BytesIO()
+        with zipfile.ZipFile(mem_zip, "a", zipfile.ZIP_DEFLATED, False) as zf:
+            for filedir in os.listdir(srcdir):
+                try:
+                    filepath = os.path.join(srcdir, filedir)
+                    if report_files["type"] == "-" and filedir not in report_files["files"]:
+                        if os.path.isdir(filepath):
+                            for subfile in os.listdir(filepath):
+                                zf.write(os.path.join(filepath, subfile), os.path.join(filedir, subfile))
+                        else:
+                            zf.write(filepath, filedir)
+                    if report_files["type"] == "+" and filedir in report_files["files"]:
+                        if os.path.isdir(filepath):
+                            for subfile in os.listdir(filepath):
+                                zf.write(os.path.join(filepath, subfile), os.path.join(filedir, subfile))
+                        else:
+                            zf.write(filepath, filedir)
+                except Exception as e:
+                    log.exception(e)
 
-        tar = tarfile.open(fileobj=s, mode="w:bz2")
-        if not os.path.exists(srcdir):
-            resp = {"error": True, "error_value": "Report doesn't exists"}
-            return Response(resp)
+            # exception for lite report that is under reports/lite.json
+            if report_format.lower() == "lite":
+                lite_report_path = os.path.join(srcdir, "reports", "lite.json")
+                if path_exists(lite_report_path):
+                    zf.write(lite_report_path, "reports/lite.json")
+                else:
+                    log.warning("Lite report does not exist. Did you enable 'litereport' in reporting.conf?")
 
-        for filedir in os.listdir(srcdir):
-            try:
-                if bzf["type"] == "-" and filedir not in bzf["files"]:
-                    tar.add(os.path.join(srcdir, filedir), arcname=filedir)
-                if bzf["type"] == "+" and filedir in bzf["files"]:
-                    tar.add(os.path.join(srcdir, filedir), arcname=filedir)
-            except Exception as e:
-                log.error(e, exc_info=True)
-        tar.close()
-        s.seek(0)
-        resp = StreamingHttpResponse(s, content_type="application/octet-stream;")
-        resp["Content-Length"] = str(len(s.getvalue()))
-        resp["Content-Disposition"] = "attachment; filename=" + report_format.lower()
+        mem_zip.seek(0)
+        resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
+        resp["Content-Length"] = len(mem_zip.getvalue())
+        resp["Content-Disposition"] = f"attachment; filename={report_format.lower()}.zip"
         return resp
 
     else:
@@ -1164,7 +1415,6 @@ def tasks_report(request, task_id, report_format="json"):
 @csrf_exempt
 @api_view(["GET"])
 def tasks_iocs(request, task_id, detail=None):
-
     if not apiconf.taskiocs.get("enabled"):
         resp = {"error": True, "error_value": "IOC download API is disabled"}
         return Response(resp)
@@ -1173,11 +1423,19 @@ def tasks_iocs(request, task_id, detail=None):
     if check["error"]:
         return Response(check)
 
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
     buf = {}
     if repconf.mongodb.get("enabled") and not buf:
-        buf = results_db.analysis.find_one({"info.id": int(task_id)})
+        buf = mongo_find_one("analysis", {"info.id": int(task_id)}, {"behavior.calls": 0})
     if es_as_db and not buf:
-        tmp = es.search(index=fullidx, doc_type="analysis", q='info.id: "%s"' % task_id)["hits"]["hits"]
+        tmp = es.search(index=get_analysis_index(), query=get_query_by_info_id(task_id))["hits"]["hits"]
         if tmp:
             buf = tmp[-1]["_source"]
         else:
@@ -1187,15 +1445,18 @@ def tasks_iocs(request, task_id, detail=None):
         return Response(resp)
     if repconf.jsondump.get("enabled") and not buf:
         jfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "reports", "report.json")
-        with open(jfile, "r") as jdata:
-            buf = json.load(jdata)
+        if os.path.normpath(jfile).startswith(ANALYSIS_BASE_PATH):
+            with open(jfile, "r") as jdata:
+                buf = json.load(jdata)
     if not buf:
         resp = {"error": True, "error_value": "Unable to retrieve report to parse for IOCs"}
         return Response(resp)
 
     data = {}
-    # if "certs" in buf:
-    #    data["certs"] = buf["certs"]
+    if "tr_extractor" in buf:
+        data["tr_extractor"] = buf["tr_extractor"]
+    if "certs" in buf:
+        data["certs"] = buf["certs"]
     data["detections"] = buf.get("detections")
     data["malscore"] = buf["malscore"]
     data["info"] = buf["info"]
@@ -1216,17 +1477,14 @@ def tasks_iocs(request, task_id, detail=None):
     # Grab target file info
     if "target" in list(buf.keys()):
         data["target"] = buf["target"]
-        if data["target"]["category"] == "file":
-            del data["target"]["file"]["path"]
-            del data["target"]["file"]["guest_paths"]
-            for x in data["target"]["file"]["yara"]:
-                for i in range(0, len(x["strings"])):
-                    x["strings"][i] = x["strings"][i].hex()
+        if data["target"].get("category") == "file" and isinstance(data["target"].get("file"), dict):
+            data["target"]["file"].pop("path", None)
+            data["target"]["file"].pop("guest_paths", None)
 
     data["network"] = {}
     if "network" in list(buf.keys()) and buf["network"]:
         data["network"]["traffic"] = {}
-        for netitem in ["tcp", "udp", "irc", "http", "dns", "smtp", "hosts", "domains"]:
+        for netitem in ("tcp", "udp", "irc", "http", "dns", "smtp", "hosts", "domains"):
             if netitem in buf["network"]:
                 data["network"]["traffic"][netitem + "_count"] = len(buf["network"][netitem])
             else:
@@ -1240,7 +1498,7 @@ def tasks_iocs(request, task_id, detail=None):
         data["network"]["ids"]["alerts"] = buf["suricata"]["alerts"]
         data["network"]["ids"]["http"] = buf["suricata"]["http"]
         data["network"]["ids"]["totalfiles"] = len(buf["suricata"]["files"])
-        data["network"]["ids"]["files"] = list()
+        data["network"]["ids"]["files"] = []
         for surifile in buf["suricata"]["files"]:
             if "file_info" in list(surifile.keys()):
                 tmpfile = surifile
@@ -1256,25 +1514,25 @@ def tasks_iocs(request, task_id, detail=None):
         pe = {}
         pdf = {}
         office = {}
-        if "peid_signatures" in buf["static"] and buf["static"]["peid_signatures"]:
+        if buf["static"].get("peid_signatures"):
             pe["peid_signatures"] = buf["static"]["peid_signatures"]
-        if "pe_timestamp" in buf["static"] and buf["static"]["pe_timestamp"]:
+        if buf["static"].get("pe_timestamp"):
             pe["pe_timestamp"] = buf["static"]["pe_timestamp"]
-        if "pe_imphash" in buf["static"] and buf["static"]["pe_imphash"]:
+        if buf["static"].get("pe_imphash"):
             pe["pe_imphash"] = buf["static"]["pe_imphash"]
-        if "pe_icon_hash" in buf["static"] and buf["static"]["pe_icon_hash"]:
+        if buf["static"].get("pe_icon_hash"):
             pe["pe_icon_hash"] = buf["static"]["pe_icon_hash"]
-        if "pe_icon_fuzzy" in buf["static"] and buf["static"]["pe_icon_fuzzy"]:
+        if buf["static"].get("pe_icon_fuzzy"):
             pe["pe_icon_fuzzy"] = buf["static"]["pe_icon_fuzzy"]
-        if "Objects" in buf["static"] and buf["static"]["Objects"]:
+        if buf["static"].get("Objects"):
             pdf["objects"] = len(buf["static"]["Objects"])
-        if "Info" in buf["static"] and buf["static"]["Info"]:
+        if buf["static"].get("Info"):
             if "PDF Header" in list(buf["static"]["Info"].keys()):
                 pdf["header"] = buf["static"]["Info"]["PDF Header"]
         if "Streams" in buf["static"]:
             if "/Page" in list(buf["static"]["Streams"].keys()):
                 pdf["pages"] = buf["static"]["Streams"]["/Page"]
-        if "Macro" in buf["static"] and buf["static"]["Macro"]:
+        if buf["static"].get("Macro"):
             if "Analysis" in buf["static"]["Macro"]:
                 office["signatures"] = {}
                 for item in buf["static"]["Macro"]["Analysis"]:
@@ -1316,24 +1574,26 @@ def tasks_iocs(request, task_id, detail=None):
         data["process_tree"] = {
             "pid": buf["behavior"]["processtree"][0]["pid"],
             "name": buf["behavior"]["processtree"][0]["name"],
-            "spawned_processes": [createProcessTreeNode(child_process) for child_process in buf["behavior"]["processtree"][0]["children"]],
+            "spawned_processes": [
+                createProcessTreeNode(child_process) for child_process in buf["behavior"]["processtree"][0]["children"]
+            ],
         }
     if "dropped" in buf:
         for entry in buf["dropped"]:
             tmpdict = {}
             if entry.get("clamav", False):
                 tmpdict["clamav"] = entry["clamav"]
-            if entry["sha256"]:
+            if entry.get("sha256"):
                 tmpdict["sha256"] = entry["sha256"]
-            if entry["md5"]:
+            if entry.get("md5"):
                 tmpdict["md5"] = entry["md5"]
-            if entry["yara"]:
+            if entry.get("yara"):
                 tmpdict["yara"] = entry["yara"]
-            if entry.get("trid", False):
+            if entry.get("trid"):
                 tmpdict["trid"] = entry["trid"]
-            if entry["type"]:
+            if entry.get("type"):
                 tmpdict["type"] = entry["type"]
-            if entry["guest_paths"]:
+            if entry.get("guest_paths"):
                 tmpdict["guest_paths"] = entry["guest_paths"]
             data["dropped"].append(tmpdict)
 
@@ -1342,7 +1602,7 @@ def tasks_iocs(request, task_id, detail=None):
         return Response(resp)
 
     if "static" in buf:
-        if "pe_versioninfo" in buf["static"] and buf["static"]["pe_versioninfo"]:
+        if buf["static"].get("pe_versioninfo"):
             data["static"]["pe"]["pe_versioninfo"] = buf["static"]["pe_versioninfo"]
 
     if "behavior" in buf and "summary" in buf["behavior"]:
@@ -1361,7 +1621,7 @@ def tasks_iocs(request, task_id, detail=None):
             else:
                 data["network"]["http"]["host"] = ""
             if "data" in req and "\r\n" in req["data"]:
-                data["network"]["http"]["data"] = req["data"].split("\r\n")[0]
+                data["network"]["http"]["data"] = req["data"].split("\r\n", 1)[0]
             else:
                 data["network"]["http"]["data"] = ""
             if "method" in req:
@@ -1382,7 +1642,6 @@ def tasks_iocs(request, task_id, detail=None):
         data["trid"] = buf["trid"]
     else:
         data["trid"] = ["None matched"]
-
     resp = {"error": False, "data": data}
     return Response(resp)
 
@@ -1390,7 +1649,6 @@ def tasks_iocs(request, task_id, detail=None):
 @csrf_exempt
 @api_view(["GET"])
 def tasks_screenshot(request, task_id, screenshot="all"):
-
     if not apiconf.taskscreenshot.get("enabled"):
         resp = {"error": True, "error_value": "Screenshot download API is disabled"}
         return Response(resp)
@@ -1399,32 +1657,42 @@ def tasks_screenshot(request, task_id, screenshot="all"):
     if check["error"]:
         return Response(check)
 
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
     srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "shots")
+    if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found: {os.path.basename(srcdir)}"})
 
     if len(os.listdir(srcdir)) == 0:
         resp = {"error": True, "error_value": "No screenshots created for task %s" % task_id}
         return Response(resp)
 
     if screenshot == "all":
-        fname = "%s_screenshots.tar.bz2" % task_id
-        s = BytesIO()
-        tar = tarfile.open(fileobj=s, mode="w:bz2")
-        for shot in os.listdir(srcdir):
-            tar.add(os.path.join(srcdir, shot), arcname=shot)
-        tar.close()
-        s.seek(0)
-        resp = StreamingHttpResponse(s, content_type="application/octet-stream;")
-        resp["Content-Length"] = str(len(s.getvalue()))
-        resp["Content-Disposition"] = "attachment; filename=" + fname
+        mem_zip = create_zip(folder=srcdir)
+        if mem_zip is False:
+            resp = {"error": True, "error_value": "Can't create zip archive for report file"}
+            return Response(resp)
+
+        resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
+        resp["Content-Length"] = len(mem_zip.getvalue())
+        resp["Content-Disposition"] = f"attachment; filename={task_id}_screenshots.zip"
         return resp
 
     else:
-        shot = srcdir + "/" + screenshot.zfill(4) + ".jpg"
-        if os.path.exists(shot):
-            resp = StreamingHttpResponse(FileWrapper(open(shot, "rb"), 8096), content_type="image/jpeg")
-            resp["Content-Length"] = os.path.getsize(shot)
-            resp["Content-Disposition"] = "attachment; filename=" + os.path.basename(shot)
-            return resp
+        for ext, ct in ((".jpg", "image/jpeg"), (".png", "image/png")):
+            shot = srcdir + "/" + screenshot.zfill(4) + ext
+            if path_exists(shot):
+                fname = f"{task_id}_{os.path.basename(shot)}"
+                resp = StreamingHttpResponse(FileWrapper(open(shot, "rb"), 8096), content_type=ct)
+                resp["Content-Length"] = os.path.getsize(shot)
+                resp["Content-Disposition"] = f"attachment; filename={fname}"
+                return resp
 
         else:
             resp = {"error": True, "error_value": "Screenshot does not exist"}
@@ -1434,7 +1702,6 @@ def tasks_screenshot(request, task_id, screenshot="all"):
 @csrf_exempt
 @api_view(["GET"])
 def tasks_pcap(request, task_id):
-
     if not apiconf.taskpcap.get("enabled"):
         resp = {"error": True, "error_value": "PCAP download API is disabled"}
         return Response(resp)
@@ -1443,8 +1710,18 @@ def tasks_pcap(request, task_id):
     if check["error"]:
         return Response(check)
 
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
     srcfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "dump.pcap")
-    if os.path.exists(srcfile):
+    if not os.path.normpath(srcfile).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found: {os.path.basename(srcfile)}"})
+    if path_exists(srcfile):
         fname = "%s_dump.pcap" % task_id
         resp = StreamingHttpResponse(FileWrapper(open(srcfile, "rb"), 8096), content_type="application/vnd.tcpdump.pcap")
         resp["Content-Length"] = os.path.getsize(srcfile)
@@ -1456,10 +1733,320 @@ def tasks_pcap(request, task_id):
         return Response(resp)
 
 
+def _resolve_task_id(task_id, enabled_key, check_tlp=True):
+    """Shared preamble for artifact-download endpoints.
+
+    Returns ((task_id, None)) on success or ((None, Response(error))) on failure.
+    `enabled_key` names the apiconf section that gates the endpoint; callers
+    that want to share a gate (e.g. all pcap variants under [taskpcap]) reuse
+    the same key. TLP:RED checks are skipped only for endpoints that need
+    to serve regardless (none at present)."""
+    section = getattr(apiconf, enabled_key, None)
+    if section is not None and not section.get("enabled"):
+        return None, Response({"error": True, "error_value": "%s download API is disabled" % enabled_key})
+    check = validate_task(task_id)
+    if check["error"]:
+        return None, Response(check)
+    if check_tlp and (check.get("tlp") or "").lower() == "red":
+        return None, Response({"error": True, "error_value": "Task has a TLP of RED"})
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+    return task_id, None
+
+
+def _serve_analysis_file(task_id, rel_path, download_name, content_type="application/octet-stream"):
+    """Stream `<analysis>/<rel_path>` back as an attachment. Returns a Response
+    object (either a StreamingHttpResponse for success, or a JSON error)."""
+    srcfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, rel_path)
+    if not os.path.normpath(srcfile).startswith(ANALYSIS_BASE_PATH):
+        return Response({"error": True, "error_value": "Invalid path"})
+    if not path_exists(srcfile) or os.path.getsize(srcfile) == 0:
+        return Response({"error": True, "error_value": f"{os.path.basename(rel_path)} does not exist"})
+    resp = StreamingHttpResponse(FileWrapper(open(srcfile, "rb"), 8192), content_type=content_type)
+    resp["Content-Length"] = os.path.getsize(srcfile)
+    resp["Content-Disposition"] = f"attachment; filename={task_id}_{download_name}"
+    return resp
+
+
+def _zip_paths(task_id, pairs, download_name):
+    """Zip (archive_name, absolute_path) pairs into a disk-backed temporary archive and
+    return it as a StreamingHttpResponse. Missing / empty sources are skipped."""
+    buf = tempfile.NamedTemporaryFile(delete=True)
+    written = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for arcname, p in pairs:
+            if path_exists(p) and os.path.getsize(p) > 0:
+                zf.write(p, arcname)
+                written += 1
+    if not written:
+        buf.close()
+        return Response({"error": True, "error_value": "No artifacts available for this task"})
+    buf.seek(0, os.SEEK_END)
+    size = buf.tell()
+    buf.seek(0)
+    resp = StreamingHttpResponse(FileWrapper(buf, 8192), content_type="application/zip")
+    resp["Content-Length"] = size
+    resp["Content-Disposition"] = f"attachment; filename={task_id}_{download_name}"
+    return resp
+
+
+def _serve_folder_zip(task_id, rel_folder, download_name, empty_msg=None):
+    """Encrypt-zip an entire directory under the analysis dir and stream it.
+    Uses `create_zip` (password = ZIP_PWD) for parity with tasks_dropped /
+    tasks_payloadfiles. Returns a Response with a JSON error if the folder
+    doesn't exist or is empty."""
+    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, rel_folder)
+    if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH):
+        return Response({"error": True, "error_value": "Invalid path"})
+    if not path_exists(srcdir) or not os.listdir(srcdir):
+        return Response({"error": True, "error_value": empty_msg or f"No {rel_folder} artifacts for task {task_id}"})
+    mem_zip = create_zip(folder=srcdir, encrypted=True, temp_file=True)
+    if mem_zip is False:
+        return Response({"error": True, "error_value": "Can't create zip archive"})
+    mem_zip.seek(0, os.SEEK_END)
+    size = mem_zip.tell()
+    mem_zip.seek(0)
+    resp = StreamingHttpResponse(FileWrapper(mem_zip, 8192), content_type="application/zip")
+    resp["Content-Length"] = size
+    resp["Content-Disposition"] = f"attachment; filename={task_id}_{download_name}"
+    return resp
+
+
+@csrf_exempt
+@api_view(["GET"])
+def tasks_tlspcap(request, task_id):
+    """Back-compat endpoint: originally served PolarProxy's tls.pcap. We've
+    since moved to SSLproxy + GoGoRoboCap which produces dump_decrypted.pcap;
+    prefer that, but fall back to the legacy path for old analyses."""
+    task_id, err = _resolve_task_id(task_id, "tasktlspcap", check_tlp=False)
+    if err:
+        return err
+
+    decrypted = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "dump_decrypted.pcap")
+    legacy = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "polarproxy", "tls.pcap")
+    for srcfile, fname in ((decrypted, "dump_decrypted.pcap"), (legacy, "tls.pcap")):
+        if not os.path.normpath(srcfile).startswith(ANALYSIS_BASE_PATH):
+            continue
+        if path_exists(srcfile) and os.path.getsize(srcfile) > 0:
+            resp = StreamingHttpResponse(
+                FileWrapper(open(srcfile, "rb"), 8096), content_type="application/vnd.tcpdump.pcap"
+            )
+            resp["Content-Length"] = os.path.getsize(srcfile)
+            resp["Content-Disposition"] = f"attachment; filename={task_id}_{fname}"
+            return resp
+    return Response({"error": True, "error_value": "TLS PCAP does not exist"})
+
+
+# Variant tables used by the consolidated dispatcher endpoints. Each handler
+# validates <variant> against a whitelist before touching the filesystem so
+# the URL parameter can't be used to probe paths outside the analysis dir.
+
+_PCAP_VARIANTS = {
+    "decrypted": ("dump_decrypted.pcap", "dump_decrypted.pcap"),
+    "mixed": ("dump_mixed.pcap", "dump_mixed.pcap"),
+    "sslproxy": (os.path.join("sslproxy", "sslproxy.pcap"), "sslproxy.pcap"),
+}
+
+_KEY_SOURCES = {
+    "tls": (os.path.join("tlsdump", "tlsdump.log"), "tlsdump.log"),
+    "ssl": (os.path.join("aux", "sslkeylogfile", "sslkeys.log"), "sslkeys.log"),
+    "master": (os.path.join("sslproxy", "master_keys.log"), "master_keys.log"),
+}
+
+_ETW_JSON_SOURCES = {
+    "dns": (os.path.join("aux", "dns_etw.json"), "dns_etw.json"),
+    "network": (os.path.join("aux", "network_etw.json"), "network_etw.json"),
+    "wmi": (os.path.join("aux", "wmi_etw.json"), "wmi_etw.json"),
+}
+
+_BULKZIP_FOLDERS = {"logs", "network", "memory", "selfextracted"}
+
+
+def _pcapng_response(task_id):
+    """On-the-fly PCAPNG with TLS keylog records embedded. Output goes to
+    a per-request tempfile — concurrent callers must not race on a shared
+    path inside the analysis dir."""
+    try:
+        from lib.cuckoo.common.pcap_utils import PcapToNg
+    except ImportError:
+        return Response({"error": True, "error_value": "PCAPNG conversion helper unavailable"})
+    adir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id)
+    pcap_path = os.path.join(adir, "dump.pcap")
+    if not path_exists(pcap_path):
+        return Response({"error": True, "error_value": "dump.pcap does not exist"})
+    tls_log_path = os.path.join(adir, "tlsdump", "tlsdump.log")
+    ssl_key_log_path = os.path.join(adir, "aux", "sslkeylogfile", "sslkeys.log")
+    tmp = tempfile.NamedTemporaryFile(
+        prefix=f"{task_id}_pcapng_", suffix=".pcapng", dir=get_cape_external_dir(), delete=False
+    )
+    tmp.close()
+    try:
+        PcapToNg(pcap_path, tls_log_path, ssl_key_log_path).generate(tmp.name)
+        if not path_exists(tmp.name) or os.path.getsize(tmp.name) == 0:
+            return Response({"error": True, "error_value": "PCAPNG generation failed"})
+        size = os.path.getsize(tmp.name)
+        # Hand the open fd to the streaming response; unlinking the path in finally
+        # keeps the fd alive through streaming and lets the kernel reclaim
+        # the inode as soon as the response finishes.
+        fd = open(tmp.name, "rb")
+        resp = StreamingHttpResponse(FileWrapper(fd, 8192), content_type="application/x-pcapng")
+        resp["Content-Length"] = size
+        resp["Content-Disposition"] = f"attachment; filename={task_id}_dump.pcapng"
+        return resp
+    finally:
+        with suppress(OSError):
+            os.unlink(tmp.name)
+
+
+def _pcapzip_response(task_id):
+    """Zip every available pcap variant (original, decrypted, mixed, sslproxy
+    raw, sslproxy cleaned). Variants that are missing or empty are silently
+    dropped so consumers only receive what actually ran."""
+    adir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id)
+    pairs = [
+        ("dump.pcap", os.path.join(adir, "dump.pcap")),
+        ("dump_decrypted.pcap", os.path.join(adir, "dump_decrypted.pcap")),
+        ("dump_mixed.pcap", os.path.join(adir, "dump_mixed.pcap")),
+        ("sslproxy.pcap", os.path.join(adir, "sslproxy", "sslproxy.pcap")),
+        ("sslproxy_clean.pcap", os.path.join(adir, "sslproxy", "sslproxy_clean.pcap")),
+    ]
+    return _zip_paths(task_id, pairs, "pcaps.zip")
+
+
+@csrf_exempt
+@api_view(["GET"])
+def tasks_pcap_variant(request, task_id, variant):
+    """Alternate PCAP artifacts for <task_id>. variant ∈
+    {decrypted, mixed, sslproxy, zip, pcapng}. The bare tasks/get/pcap/<id>/
+    remains for back-compat with existing callers (serves dump.pcap)."""
+    task_id, err = _resolve_task_id(task_id, "taskpcap")
+    if err:
+        return err
+    v = (variant or "").lower()
+    if v in _PCAP_VARIANTS:
+        rel_path, fname = _PCAP_VARIANTS[v]
+        return _serve_analysis_file(task_id, rel_path, fname, content_type="application/vnd.tcpdump.pcap")
+    if v == "zip":
+        return _pcapzip_response(task_id)
+    if v == "pcapng":
+        return _pcapng_response(task_id)
+    return Response({"error": True, "error_value": f"Unknown pcap variant: {variant}"})
+
+
+@csrf_exempt
+@api_view(["GET"])
+def tasks_keys(request, task_id, kind):
+    """TLS keylog material. kind ∈ {tls, ssl, master} — each refers to a
+    different hook source (tls: MockSSL → tlsdump.log; ssl: bcrypt/NCrypt →
+    aux/sslkeylogfile/sslkeys.log; master: SSLproxy → master_keys.log).
+    All three are NSS-format keylogs."""
+    task_id, err = _resolve_task_id(task_id, "tasktlskeys")
+    if err:
+        return err
+    k = (kind or "").lower()
+    if k not in _KEY_SOURCES:
+        return Response({"error": True, "error_value": f"Unknown keys kind: {kind}"})
+    rel_path, fname = _KEY_SOURCES[k]
+    return _serve_analysis_file(task_id, rel_path, fname, content_type="text/plain")
+
+
+@csrf_exempt
+@api_view(["GET"])
+def tasks_etw(request, task_id, kind):
+    """ETW telemetry downloads. kind ∈ {dns, network, wmi} each map to an
+    NDJSON stream; kind == amsi zips the per-buffer AMSI script captures."""
+    task_id, err = _resolve_task_id(task_id, "tasketw")
+    if err:
+        return err
+    k = (kind or "").lower()
+    if k in _ETW_JSON_SOURCES:
+        rel_path, fname = _ETW_JSON_SOURCES[k]
+        return _serve_analysis_file(task_id, rel_path, fname, content_type="application/x-ndjson")
+    if k == "amsi":
+        return _serve_folder_zip(task_id, os.path.join("aux", "amsi_etw"), "amsi_etw.zip")
+    return Response({"error": True, "error_value": f"Unknown etw kind: {kind}"})
+
+
+@csrf_exempt
+@api_view(["GET"])
+def tasks_bulkzip(request, task_id, folder):
+    """Encrypt-zip an entire analysis subdirectory. folder is whitelisted
+    to {logs, network, memory, selfextracted}. Archive is AES-encrypted
+    with ZIP_PWD for parity with tasks_dropped / tasks_payloadfiles /
+    tasks_procdumpfiles."""
+    task_id, err = _resolve_task_id(task_id, "taskbulkzip")
+    if err:
+        return err
+    f = (folder or "").lower()
+    if f not in _BULKZIP_FOLDERS:
+        return Response({"error": True, "error_value": f"Unknown bulkzip folder: {folder}"})
+    return _serve_folder_zip(task_id, f, f"{f}.zip")
+
+
+@csrf_exempt
+@api_view(["GET"])
+def tasks_evtx(request, task_id):
+    if not apiconf.taskevtx.get("enabled"):
+        resp = {"error": True, "error_value": "EVTX download API is disabled"}
+        return Response(resp)
+
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
+
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
+    evtxfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "evtx", "evtx.zip")
+    if not os.path.normpath(evtxfile).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found: {os.path.basename(evtxfile)}"})
+    if path_exists(evtxfile):
+        fname = "%s_evtx.zip" % task_id
+        resp = StreamingHttpResponse(FileWrapper(open(evtxfile, "rb")), content_type="application/zip")
+        resp["Content-Length"] = os.path.getsize(evtxfile)
+        resp["Content-Disposition"] = "attachment; filename=" + fname
+        return resp
+
+    else:
+        resp = {"error": True, "error_value": "EVTX does not exist"}
+        return Response(resp)
+
+
+@csrf_exempt
+@api_view(["GET"])
+def tasks_mitmdump(request, task_id):
+    if not apiconf.mitmdump.get("enabled"):
+        resp = {"error": True, "error_value": "Mitmdump HAR download API is disabled"}
+        return Response(resp)
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+    harfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "mitmdump", "dump.har")
+    if not os.path.normpath(harfile).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found: {os.path.basename(harfile)}"})
+    if path_exists(harfile):
+        fname = "%s_dump.har" % task_id
+        resp = StreamingHttpResponse(FileWrapper(open(harfile, "rb")), content_type="text/plain")
+        resp["Content-Length"] = os.path.getsize(harfile)
+        resp["Content-Disposition"] = "attachment; filename=" + fname
+        return resp
+    else:
+        resp = {"error": True, "error_value": "HAR file does not exist"}
+        return Response(resp)
+
+
 @csrf_exempt
 @api_view(["GET"])
 def tasks_dropped(request, task_id):
-
     if not apiconf.taskdropped.get("enabled"):
         resp = {"error": True, "error_value": "Dropped File download API is disabled"}
         return Response(resp)
@@ -1468,40 +2055,147 @@ def tasks_dropped(request, task_id):
     if check["error"]:
         return Response(check)
 
-    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "files")
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
-    if not os.path.exists(srcdir) or not len(os.listdir(srcdir)):
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
+    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "files")
+    if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found: {os.path.basename(srcdir)}"})
+
+    if not path_exists(srcdir) or not len(os.listdir(srcdir)):
         resp = {"error": True, "error_value": "No files dropped for task %s" % task_id}
         return Response(resp)
 
     else:
-        fname = "%s_dropped.tar.bz2" % task_id
-        s = BytesIO()
-        tar = tarfile.open(fileobj=s, mode="w:bz2")
-        for dirfile in os.listdir(srcdir):
-            tar.add(os.path.join(srcdir, dirfile), arcname=dirfile)
-        tar.close()
-        s.seek(0)
+        mem_zip = create_zip(folder=srcdir, encrypted=True)
+        if mem_zip is False:
+            resp = {"error": True, "error_value": "Can't create zip archive for report file"}
+            return Response(resp)
 
         # in Mb
         dropped_max_size_limit = request.GET.get("max_size", False)
         # convert to MB
-        size = len(s.getvalue())
-        size_in_mb = int(size/1024/1024)
+        size = len(mem_zip.getvalue())
+        size_in_mb = int(size / 1024 / 1024)
         if dropped_max_size_limit and size_in_mb > int(dropped_max_size_limit):
-            resp = {"error": True, "error_value": "Archive is bigger than max size. Current size is {}".format(size_in_mb)}
+            resp = {
+                "error": True,
+                "error_value": "Archive is bigger than max size. Current size is {}".format(size_in_mb),
+            }
             return Response(resp)
 
-        resp = StreamingHttpResponse(s, content_type="application/octet-stream;")
-        resp["Content-Length"] = str(len(s.getvalue()))
-        resp["Content-Disposition"] = "attachment; filename=" + fname
+        resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
+        resp["Content-Length"] = len(mem_zip.getvalue())
+        resp["Content-Disposition"] = f"attachment; filename={task_id}_dropped.zip"
         return resp
 
 
 @csrf_exempt
 @api_view(["GET"])
-def tasks_surifile(request, task_id):
+def tasks_selfextracted(request, task_id, tool="all"):
+    if not apiconf.taskselfextracted.get("enabled"):
+        resp = {"error": True, "error_value": "Self Extracted File download API is disabled"}
+        return Response(resp)
 
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
+
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
+    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "selfextracted")
+    if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found: {os.path.basename(srcdir)}"})
+
+    if not path_exists(srcdir) or not len(os.listdir(srcdir)):
+        resp = {"error": True, "error_value": "No self extracted files for task %s" % task_id}
+        return Response(resp)
+
+    selfextract_data = {}
+
+    if repconf.mongodb.enabled:
+        tmp = mongo_find_one("analysis", {"info.id": int(task_id)}, {"selfextract": 1})
+        if tmp and "selfextract" in tmp:
+            selfextract_data = tmp["selfextract"]
+    elif es_as_db:
+        tmp = es.search(
+            index=get_analysis_index(), query=get_query_by_info_id(str(task_id)), _source=["selfextract"]
+        )["hits"]["hits"]
+        if tmp:
+            selfextract_data = tmp[-1]["_source"].get("selfextract", {})
+
+    if not selfextract_data:
+        jfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "reports", "report.json")
+        if path_exists(jfile):
+            try:
+                with open(jfile, "r") as f:
+                    rep = json.load(f)
+                    selfextract_data = rep.get("selfextract", {})
+            except Exception as e:
+                log.error(e)
+
+    if tool != "all" and tool not in selfextract_data:
+        resp = {"error": True, "error_value": f"Tool {tool} not found in analysis data"}
+        return Response(resp)
+
+    mem_zip = BytesIO()
+    with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        if tool == "all":
+            if selfextract_data:
+                processed_sha256s = set()
+                for tname, tdata in selfextract_data.items():
+                    for fmeta in tdata.get("extracted_files", []):
+                        sha256 = fmeta.get("sha256")
+                        if not sha256 or not re.match(r"^[a-fA-F0-9]{64}$", sha256):
+                            continue
+
+                        fpath = os.path.join(srcdir, sha256)
+                        if not os.path.exists(fpath):
+                            continue
+
+                        arcname = os.path.join(tname, sha256)
+                        zf.write(fpath, arcname)
+                        processed_sha256s.add(sha256)
+
+                for f in os.listdir(srcdir):
+                    if f not in processed_sha256s:
+                        zf.write(os.path.join(srcdir, f), f)
+            else:
+                for f in os.listdir(srcdir):
+                    zf.write(os.path.join(srcdir, f), f)
+        else:
+            tdata = selfextract_data[tool]
+            for fmeta in tdata.get("extracted_files", []):
+                sha256 = fmeta.get("sha256")
+                if not sha256 or not re.match(r"^[a-fA-F0-9]{64}$", sha256):
+                    continue
+
+                fpath = os.path.join(srcdir, sha256)
+                if not os.path.exists(fpath):
+                    continue
+
+                zf.write(fpath, sha256)
+
+    mem_zip.seek(0)
+    resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
+    resp["Content-Length"] = len(mem_zip.getvalue())
+    resp["Content-Disposition"] = f"attachment; filename={task_id}_selfextracted_{tool}.zip"
+    return resp
+
+
+@csrf_exempt
+@api_view(["GET"])
+def tasks_surifile(request, task_id):
     if not apiconf.taskdropped.get("enabled"):
         resp = {"error": True, "error_value": "Suricata File download API is disabled"}
         return Response(resp)
@@ -1510,13 +2204,21 @@ def tasks_surifile(request, task_id):
     if check["error"]:
         return Response(check)
 
-    srcfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "logs", "files.zip")
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
-    if os.path.exists(srcfile):
-        fname = "%s_surifiles.zip" % task_id
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
+    srcfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "logs", "files.zip")
+    if not os.path.normpath(srcfile).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found: {os.path.basename(srcfile)}"})
+    if path_exists(srcfile):
         resp = StreamingHttpResponse(FileWrapper(open(srcfile, "rb"), 8192), content_type="application/octet-stream;")
         resp["Content-Length"] = os.path.getsize(srcfile)
-        resp["Content-Disposition"] = "attachment; filename=" + fname
+        resp["Content-Disposition"] = f"attachment; filename={task_id}_surifiles.zip"
         return resp
 
     else:
@@ -1541,7 +2243,11 @@ def tasks_rollingsuri(request, window=60):
     gen_time = datetime.now() - timedelta(minutes=window)
     dummy_id = ObjectId.from_datetime(gen_time)
     result = list(
-        results_db.analysis.find({"suricata.alerts": {"$exists": True}, "_id": {"$gte": dummy_id}}, {"suricata.alerts": 1, "info.id": 1})
+        mongo_find(
+            "analysis",
+            {"suricata.alerts": {"$exists": True}, "_id": {"$gte": dummy_id}},
+            {"suricata.alerts": 1, "info.id": 1},
+        )
     )
     resp = []
     for e in result:
@@ -1554,55 +2260,7 @@ def tasks_rollingsuri(request, window=60):
 
 @csrf_exempt
 @api_view(["GET"])
-def tasks_rollingshrike(request, window=60, msgfilter=None):
-    window = int(window)
-
-    if not apiconf.rollingshrike.get("enabled"):
-        resp = {"error": True, "error_value": "Rolling Shrike API is disabled"}
-        return Response(resp)
-    maxwindow = apiconf.rollingshrike.get("maxwindow")
-    if maxwindow > 0:
-        if window > maxwindow:
-            resp = {"error": True, "error_value": "The Window You Specified is greater than the configured maximum"}
-            return Response(resp)
-
-    gen_time = datetime.now() - timedelta(minutes=window)
-    dummy_id = ObjectId.from_datetime(gen_time)
-    if msgfilter:
-        result = results_db.analysis.find(
-            {
-                "info.shrike_url": {"$exists": True, "$ne": None},
-                "_id": {"$gte": dummy_id},
-                "info.shrike_msg": {"$regex": msgfilter, "$options": "-1"},
-            },
-            {"info.id": 1, "info.shrike_msg": 1, "info.shrike_sid": 1, "info.shrike_url": 1, "info.shrike_refer": 1},
-            sort=[("_id", pymongo.DESCENDING)],
-        )
-    else:
-        result = results_db.analysis.find(
-            {"info.shrike_url": {"$exists": True, "$ne": None}, "_id": {"$gte": dummy_id}},
-            {"info.id": 1, "info.shrike_msg": 1, "info.shrike_sid": 1, "info.shrike_url": 1, "info.shrike_refer": 1},
-            sort=[("_id", pymongo.DESCENDING)],
-        )
-
-    resp = []
-    for e in result:
-        tmp = {}
-        tmp["id"] = e["info"]["id"]
-        tmp["shrike_msg"] = e["info"]["shrike_msg"]
-        tmp["shrike_sid"] = e["info"]["shrike_sid"]
-        tmp["shrike_url"] = e["info"]["shrike_url"]
-        if "shrike_refer" in e["info"] and e["info"]["shrike_refer"]:
-            tmp["shrike_refer"] = e["info"]["shrike_refer"]
-        resp.append(tmp)
-
-    return Response(resp)
-
-
-@csrf_exempt
-@api_view(["GET"])
 def tasks_procmemory(request, task_id, pid="all"):
-
     if not apiconf.taskprocmemory.get("enabled"):
         resp = {"error": True, "error_value": "Process memory download API is disabled"}
         return Response(resp)
@@ -1611,58 +2269,76 @@ def tasks_procmemory(request, task_id, pid="all"):
     if check["error"]:
         return Response(check)
 
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
     # Check if any process memory dumps exist
-    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "memory")
-    if not os.path.exists(srcdir):
+    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", f"{task_id}", "memory")
+    if not path_exists(srcdir):
         resp = {"error": True, "error_value": "No memory dumps saved"}
         return Response(resp)
 
+    parent_folder = os.path.dirname(srcdir)
+    analysis_dir = os.path.join(CUCKOO_ROOT, "storage", "analyses", f"{task_id}")
     if pid == "all":
         if not apiconf.taskprocmemory.get("all"):
             resp = {"error": True, "error_value": "Downloading of all process memory dumps is disabled"}
             return Response(resp)
-
-        fname = "%s_procdumps.tar.bz2" % task_id
-        s = BytesIO()
-        tar = tarfile.open(fileobj=s, mode="w:bz2")
-        for memdump in os.listdir(srcdir):
-            tar.add(os.path.join(srcdir, memdump), arcname=memdump)
-        tar.close()
-        s.seek(0)
-        resp = StreamingHttpResponse(s, content_type="application/octet-stream;")
-        resp["Content-Length"] = str(len(s.getvalue()))
-        resp["Content-Disposition"] = "attachment; filename=" + fname
-    else:
-        srcfile = srcdir + "/" + pid + ".dmp"
-        if os.path.exists(srcfile):
-            if apiconf.taskprocmemory.get("compress"):
-                fname = srcfile.split("/")[-1]
-                s = BytesIO()
-                tar = tarfile.open(fileobj=s, mode="w:bz2")
-                tar.add(srcfile, arcname=fname)
-                tar.close()
-                s.seek(0)
-                resp = StreamingHttpResponse(s, content_type="application/octet-stream;")
-                archive = "%s-%s_dmp.tar.bz2" % (task_id, pid)
-                resp["Content-Length"] = str(len(s.getvalue()))
-                resp["Content-Disposition"] = "attachment; filename=" + archive
-            else:
-                mime = "application/octet-stream"
-                fname = "%s-%s.dmp" % (task_id, pid)
-                resp = StreamingHttpResponse(FileWrapper(open(srcfile, "rb"), 8096), content_type=mime)
-                resp["Content-Length"] = os.path.getsize(srcfile)
-                resp["Content-Disposition"] = "attachment; filename=" + fname
+        if USE_SEVENZIP:
+            zip_path = os.path.join(analysis_dir, "procdumps.zip")
+            try:
+                subprocess.check_call(["/usr/bin/7z", f"-p{settings.ZIP_PWD.decode()}", "a", zip_path, srcdir])
+            except subprocess.CalledProcessError:
+                resp = {"error": True, "error_value": "error compressing file"}
+                return Response(resp)
+            # using `with` prematurely closes the file
+            zip_fd = open(zip_path, "rb")
+            resp = StreamingHttpResponse(zip_fd, content_type="application/zip")
+            resp["Content-Length"] = os.path.getsize(zip_path)
         else:
-            resp = {"error": True, "error_value": "Process memory dump does not exist for " "pid %s" % pid}
+            mem_zip = create_zip(folder=srcdir, encrypted=True)
+            if mem_zip is False:
+                resp = {"error": True, "error_value": "Can't create zip archive for report file"}
+                return Response(resp)
+            resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
+            resp["Content-Length"] = len(mem_zip.getvalue())
+        resp["Content-Disposition"] = f"attachment; filename={task_id}_procdumps.zip"
+        return resp
+    else:
+        filepath = os.path.join(parent_folder, pid + ".dmp")
+        if path_exists(filepath):
+            if USE_SEVENZIP:
+                zip_path = os.path.join(analysis_dir, f"{task_id}-{pid}_dmp.zip")
+                try:
+                    subprocess.check_call([SEVENZIP_PATH, f"-p{settings.ZIP_PWD.decode()}", "a", zip_path, filepath])
+                except subprocess.CalledProcessError:
+                    resp = {"error": True, "error_value": "error compressing file"}
+                    return Response(resp)
+                zip_fd = open(zip_path, "rb")
+                resp = StreamingHttpResponse(zip_fd, content_type="application/zip")
+                resp["Content-Length"] = os.path.getsize(zip_path)
+            else:
+                mem_zip = create_zip(files=filepath, encrypted=True)
+                if mem_zip is False:
+                    resp = {"error": True, "error_value": "Can't create zip archive for report file"}
+                    return Response(resp)
+                resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
+                resp["Content-Length"] = len(mem_zip.getvalue())
+            resp["Content-Disposition"] = f"attachment; filename={task_id}-{pid}_dmp.zip"
+            return resp
+        else:
+            resp = {"error": True, "error_value": "Process memory dump does not exist for pid %s" % pid}
             return Response(resp)
-
-    return resp
 
 
 @csrf_exempt
 @api_view(["GET"])
 def tasks_fullmemory(request, task_id):
-
     if not apiconf.taskfullmemory.get("enabled"):
         resp = {"error": True, "error_value": "Full memory download API is disabled"}
         return Response(resp)
@@ -1671,31 +2347,30 @@ def tasks_fullmemory(request, task_id):
     if check["error"]:
         return Response(check)
 
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
     filename = ""
     file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory.dmp")
-    if os.path.exists(file_path):
+    if path_exists(file_path):
         filename = os.path.basename(file_path)
-    elif os.path.exists(file_path + ".zip"):
+    elif path_exists(file_path + ".zip"):
         file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory.dmp.zip")
-        if os.path.exists(file_path):
+        if path_exists(file_path):
             filename = os.path.basename(file_path)
-    elif repconf.distributed.enabled:
-        # check for memdump on slave
-        try:
-            res = requests.get("http://127.0.0.1:9003/task/{task_id}".format(task_id=task_id), verify=False, timeout=30)
-            if res and res.ok and res.json()["status"] == 1:
-                url = res.json()["url"]
-                dist_task_id = res.json()["task_id"]
-                return redirect(url.replace(":8090", ":8000") + "apiv2/tasks/get/fullmemory/" + str(dist_task_id) + "/", permanent=True)
-        except Exception as e:
-            log.error(e)
 
     if filename:
         content_type = "application/octet-stream"
         chunk_size = 8192
+        fname = f"{task_id}_{filename}"
         response = StreamingHttpResponse(FileWrapper(open(file_path, "rb"), chunk_size), content_type=content_type)
         response["Content-Length"] = os.path.getsize(file_path)
-        response["Content-Disposition"] = "attachment; filename=%s" % filename
+        response["Content-Disposition"] = f"attachment; filename={fname}"
         return response
     else:
         resp = {"error": True, "error_value": "Memory dump not found for task " + task_id}
@@ -1705,48 +2380,97 @@ def tasks_fullmemory(request, task_id):
 @csrf_exempt
 @api_view(["GET"])
 def file(request, stype, value):
-
-    if not apiconf.sampledl.get("enabled"):
+    if not apiconf.sampledl.get("enabled", False):
         resp = {"error": True, "error_value": "Sample download API is disabled"}
         return Response(resp)
 
+    # This Func is not Synced with views.py "def file()"
+
     file_hash = False
-    if stype == "md5":
-        file_hash = db.find_sample(md5=value).to_dict()["sha256"]
-    elif stype == "sha1":
-        file_hash = db.find_sample(sha1=value).to_dict()["sha256"]
-    elif stype == "sha256":
+    if stype in ("md5", "sha1", "sha256"):
         file_hash = value
     elif stype == "task":
         check = validate_task(value)
         if check["error"]:
             return Response(check)
+
         sid = db.view_task(value).to_dict()["sample_id"]
         file_hash = db.view_sample(sid).to_dict()["sha256"]
 
-    sample = os.path.join(CUCKOO_ROOT, "storage", "binaries", file_hash)
-    if os.path.exists(sample):
-        resp = StreamingHttpResponse(FileWrapper(open(sample, "rb"), 8096), content_type="application/octet-stream")
-        resp["Content-Length"] = os.path.getsize(sample)
-        resp["Content-Disposition"] = "attachment; filename=" + "%s.bin" % file_hash
-        return resp
-
-    else:
+    if not file_hash:
         resp = {"error": True, "error_value": "Sample %s was not found" % file_hash}
-        return Response(file_hash)
+        return Response(resp)
+
+    paths = db.sample_path_by_hash(sample_hash=file_hash)
+
+    if not paths:
+        resp = {"error": True, "error_value": "Sample %s was not found" % file_hash}
+        return Response(resp)
+
+    for sample in paths:
+        if request.GET.get("encrypted"):
+            # Check if file exists in temp folder
+            ext_dir = get_cape_external_dir()
+            zip_path = os.path.join(ext_dir, f"{file_hash}.zip")
+            file_exists = os.path.isfile(zip_path)
+            if file_exists:
+                resp = StreamingHttpResponse(FileWrapper(open(zip_path, "rb"), 8096), content_type="application/zip")
+                resp["Content-Disposition"] = f"attachment; filename={file_hash}.zip"
+                return resp
+
+            tmp_zip_fd = tempfile.NamedTemporaryFile(
+                dir=ext_dir, prefix=f".{file_hash}_", suffix=".zip", delete=False
+            )
+            tmp_zip_path = tmp_zip_fd.name
+            tmp_zip_fd.close()
+            with suppress(OSError):
+                os.unlink(tmp_zip_path)
+
+            if USE_SEVENZIP:
+                try:
+                    subprocess.check_call([SEVENZIP_PATH, f"-p{settings.ZIP_PWD.decode()}", "a", tmp_zip_path, sample])
+                    os.replace(tmp_zip_path, zip_path)
+                except (subprocess.CalledProcessError, OSError):
+                    with suppress(OSError):
+                        os.unlink(tmp_zip_path)
+                    resp = {"error": True, "error_value": "error compressing file"}
+                    return Response(resp)
+                zip_fd = open(zip_path, "rb")
+                resp = StreamingHttpResponse(zip_fd, content_type="application/zip")
+                resp["Content-Length"] = os.path.getsize(zip_path)
+                resp["Content-Disposition"] = f"attachment; filename={file_hash}.zip"
+                return resp
+            else:
+                # If files does not exist encrypt and move to tmp folder atomically
+                try:
+                    with pyzipper.AESZipFile(tmp_zip_path, "w", encryption=pyzipper.WZ_AES) as zf:
+                        zf.setpassword(b"infected")
+                        zf.write(sample, os.path.basename(sample), zipfile.ZIP_DEFLATED)
+                    os.replace(tmp_zip_path, zip_path)
+                except Exception:
+                    with suppress(OSError):
+                        os.unlink(tmp_zip_path)
+                    raise
+                resp = StreamingHttpResponse(FileWrapper(open(zip_path, "rb"), 8096), content_type="application/zip")
+                resp["Content-Disposition"] = f"attachment; filename={file_hash}.zip"
+            return resp
+        else:
+            resp = StreamingHttpResponse(FileWrapper(open(sample, "rb"), 8096), content_type="application/octet-stream")
+            resp["Content-Length"] = os.path.getsize(sample)
+            resp["Content-Disposition"] = f"attachment; filename={file_hash}.bin"
+        return resp
 
 
 @csrf_exempt
 @api_view(["GET"])
 def machines_list(request):
-
     if not apiconf.machinelist.get("enabled"):
         resp = {"error": True, "error_value": "Machine list API is disabled"}
         return Response(resp)
 
     resp = {}
     resp["data"] = []
-    resp["error"] = False
+    resp["error"] = []
     machines = db.list_machines()
     for row in machines:
         resp["data"].append(row.to_dict())
@@ -1755,8 +2479,27 @@ def machines_list(request):
 
 @csrf_exempt
 @api_view(["GET"])
-def machines_view(request, name=None):
+def exit_nodes_list(request):
+    if not apiconf.list_exitnodes.get("enabled"):
+        resp = {"error": True, "error_value": "Exit nodes list API is disabled"}
+        return Response(resp)
 
+    resp = {}
+    resp["data"] = []
+    resp["error"] = []
+    resp["data"] += ["socks:" + sock5 for sock5 in apply_route_filter(list(_load_socks5_operational() or []), "socks5")]
+    resp["data"] += ["vpn:" + vpn for vpn in apply_route_filter(list(vpns.keys()), "vpn")]
+    if routing_conf.tor.enabled and apply_route_filter(["tor"]):
+        resp["data"].append("tor")
+    if routing_conf.inetsim.enabled and apply_route_filter(["inetsim"]):
+        resp["data"].append("inetsim")
+
+    return Response(resp)
+
+
+@csrf_exempt
+@api_view(["GET"])
+def machines_view(request, name=None):
     if not apiconf.machineview.get("enabled"):
         resp = {"error": True, "error_value": "Machine view API is disabled"}
         return Response(resp)
@@ -1765,7 +2508,7 @@ def machines_view(request, name=None):
     machine = db.view_machine(name=name)
     if machine:
         resp["data"] = machine.to_dict()
-        resp["error"] = False
+        resp["error"] = []
     else:
         resp["error"] = True
         resp["error_value"] = "Machine not found"
@@ -1787,17 +2530,21 @@ def cuckoo_status(request):
         resp["error"] = True
         resp["error_value"] = "Cuckoo Status API is disabled"
     else:
-        resp["error"] = False
+        resp["error"] = []
+        tasks_dict_with_counts = db.get_tasks_status_count()
+        total_sum = 0
+        if isinstance(tasks_dict_with_counts, dict):
+            total_sum = sum(tasks_dict_with_counts.values())
         resp["data"] = dict(
             version=CUCKOO_VERSION,
             hostname=socket.gethostname(),
             machines=dict(total=len(db.list_machines()), available=db.count_machines_available()),
             tasks=dict(
-                total=db.count_tasks(),
-                pending=db.count_tasks("pending"),
-                running=db.count_tasks("running"),
-                completed=db.count_tasks("completed"),
-                reported=db.count_tasks("reported"),
+                total=total_sum,
+                pending=tasks_dict_with_counts.get("pending", 0),
+                running=tasks_dict_with_counts.get("running", 0),
+                completed=tasks_dict_with_counts.get("completed", 0),
+                reported=tasks_dict_with_counts.get("reported", 0),
             ),
         )
 
@@ -1815,7 +2562,12 @@ def cuckoo_status(request):
 
             # add more from https://pypi.org/project/psutil/
             resp["data"]["server"] = {
-                "storage": {"free": hdd_free, "total": hdd_total, "used": hdd_used, "used_by": "{}%".format(hdd_percent_used)},
+                "storage": {
+                    "free": hdd_free,
+                    "total": hdd_total,
+                    "used": hdd_used,
+                    "used_by": "{}%".format(hdd_percent_used),
+                },
                 "ram": {"free": ram_free, "total": ram_total, "used": ram_used},
             }
     return Response(resp)
@@ -1824,18 +2576,15 @@ def cuckoo_status(request):
 @csrf_exempt
 @api_view(["GET"])
 def task_x_hours(request):
-
-    session = db.Session()
-    res = (
-        session.query(Task)
-        .filter(Task.added_on.between(datetime.datetime.now(), datetime.datetime.now() - datetime.timedelta(days=1)))
-        .all()
-    )
-    results = dict()
-    if res:
-        for date, samples in res:
-            results.setdefault(date.strftime("%Y-%m-%eT%H:%M:00"), samples)
-    session.close()
+    """Number of tasks added per hour during the last 24 hours."""
+    since = datetime.now() - timedelta(days=1)
+    with db.transaction():
+        stmt = apply_sql_task_filter(select(Task.added_on).where(Task.added_on >= since))
+        added = db.session.scalars(stmt).all()
+    results = {}
+    for added_on in added:
+        bucket = added_on.strftime("%Y-%m-%dT%H:00:00")
+        results[bucket] = results.get(bucket, 0) + 1
     resp = {"error": False, "stats": results}
     return Response(resp)
 
@@ -1843,9 +2592,8 @@ def task_x_hours(request):
 @csrf_exempt
 @api_view(["GET"])
 def tasks_latest(request, hours):
-
     resp = {}
-    resp["error"] = False
+    resp["error"] = []
     timestamp = datetime.now() - timedelta(hours=int(hours))
     ids = db.list_tasks(completed_after=timestamp)
     resp["ids"] = [id.to_dict() for id in ids]
@@ -1855,7 +2603,6 @@ def tasks_latest(request, hours):
 @csrf_exempt
 @api_view(["GET"])
 def tasks_payloadfiles(request, task_id):
-
     if not apiconf.payloadfiles.get("enabled"):
         resp = {"error": True, "error_value": "CAPE payload file download API is disabled"}
         return Response(resp)
@@ -1864,38 +2611,35 @@ def tasks_payloadfiles(request, task_id):
     if check["error"]:
         return Response(check)
 
-    try:
-        zippwd = settings.ZIP_PWD
-    except AttributeError:
-        zippwd = b"infected"
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
-    capepath = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "CAPE")
 
-    if os.path.exists(capepath):
-        if not HAVE_PYZIPPER:
-            return Response({"error": True, "error_value": "Install pyzipper to be able to download files"})
-        mem_zip = BytesIO()
-        with pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES) as zf:
-            zf.setpassword(zippwd)
-            for fname in next(os.walk(capepath))[2]:
-                if len(fname) == 64:
-                    filepath = os.path.join(capepath, fname)
-                    with open(filepath, "rb") as f:
-                        zf.writestr(os.path.basename(filepath), f.read())
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
 
-        mem_zip.seek(0)
+    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "CAPE")
+
+    if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH):
+        return render(request, "error.html", {"error": f"File not found: {os.path.basename(srcdir)}"})
+
+    if path_exists(srcdir):
+        mem_zip = create_zip(folder=srcdir, encrypted=True)
+        if mem_zip is False:
+            resp = {"error": True, "error_value": "Can't create zip archive for report file"}
+            return Response(resp)
+
         resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
         resp["Content-Length"] = len(mem_zip.getvalue())
         resp["Content-Disposition"] = f"attachment; filename=cape_payloads_{task_id}.zip"
         return resp
-    else:
-        return Response({"error": True, "error_value": f"No CAPE file(s) for task {task_id}."})
+    return Response({"error": True, "error_value": f"No CAPE file(s) for task {task_id}."})
 
 
 @csrf_exempt
 @api_view(["GET"])
 def tasks_procdumpfiles(request, task_id):
-
     if not apiconf.procdumpfiles.get("enabled"):
         resp = {"error": True, "error_value": "Procdump file download API is disabled"}
         return Response(resp)
@@ -1904,29 +2648,23 @@ def tasks_procdumpfiles(request, task_id):
     if check["error"]:
         return Response(check)
 
-    try:
-        zippwd = settings.ZIP_PWD
-    except AttributeError:
-        zippwd = b"infected"
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
 
     # ToDo add all/one
 
-    procdumppath = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "procdump")
+    srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "procdump")
+    if path_exists(srcdir):
+        mem_zip = create_zip(folder=srcdir, encrypted=True)
+        if mem_zip is False:
+            resp = {"error": True, "error_value": "Can't create zip archive for report file"}
+            return Response(resp)
 
-    # ToDo check bad rturn
-    if os.path.exists(procdumppath):
-        if not HAVE_PYZIPPER:
-            return Response({"error": True, "error_value": "Install pyzipper to be able to download files"})
-        mem_zip = BytesIO()
-        with pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES) as zf:
-            zf.setpassword(zippwd)
-            for fname in next(os.walk(procdumppath))[2]:
-                if len(fname) == 64:
-                    filepath = os.path.join(procdumppath, fname)
-                    with open(filepath, "rb") as f:
-                        zf.writestr(os.path.basename(filepath), f.read())
-
-        mem_zip.seek(0)
         resp = StreamingHttpResponse(mem_zip, content_type="application/zip")
         resp["Content-Length"] = len(mem_zip.getvalue())
         resp["Content-Disposition"] = f"attachment; filename=cape_payloads_{task_id}.zip"
@@ -1939,7 +2677,6 @@ def tasks_procdumpfiles(request, task_id):
 @csrf_exempt
 @api_view(["GET"])
 def tasks_config(request, task_id, cape_name=False):
-
     if not apiconf.capeconfig.get("enabled"):
         resp = {"error": True, "error_value": "Config download API is disabled"}
         return Response(resp)
@@ -1948,74 +2685,68 @@ def tasks_config(request, task_id, cape_name=False):
     if check["error"]:
         return Response(check)
 
-    buf = dict()
+    if check.get("tlp", "") in ("red", "Red"):
+        return Response({"error": True, "error_value": "Task has a TLP of RED"})
+
+
+    rtid = check.get("rtid", 0)
+    if rtid:
+        task_id = rtid
+
+    buf = {}
     if repconf.mongodb.get("enabled"):
-        buf = results_db.analysis.find_one({"info.id": int(task_id)}, {"CAPE": 1}, sort=[("_id", pymongo.DESCENDING)])
-    if repconf.jsondump.get("enabled") and not buf:
-        jfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "reports", "report.json")
-        with open(jfile, "r") as jdata:
-            buf = json.load(jdata)
+        buf = mongo_find_one("analysis", {"info.id": int(task_id)}, {"CAPE.configs": 1}, sort=[("_id", -1)])
     if es_as_db and not buf:
-        tmp = es.search(index=fullidx, doc_type="analysis", q='info.id: "%s"' % str(task_id))["hits"]["hits"]
+        tmp = es.search(index=get_analysis_index(), query=get_query_by_info_id(task_id))["hits"]["hits"]
         if len(tmp) > 1:
             buf = tmp[-1]["_source"]
         elif len(tmp) == 1:
             buf = tmp[0]["_source"]
         else:
             buf = None
+    if repconf.jsondump.get("enabled") and not buf:
+        jfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "reports", "report.json")
+        if os.path.normpath(jfile).startswith(ANALYSIS_BASE_PATH):
+            with open(jfile, "r") as jdata:
+                buf = json.load(jdata)
 
-    if buf.get("CAPE"):
-        try:
-            buf["CAPE"] = json.loads(decompress(buf["CAPE"]))
-        except:
-            pass
-
-        if isinstance(buf, dict) and buf.get("CAPE", False):
-            try:
-                buf["CAPE"] = json.loads(decompress(buf["CAPE"]))
-            except:
-                # In case compress results processing module is not enabled
-                pass
-            data = []
-            if not isinstance(buf["CAPE"], list) and buf["CAPE"].get("configs"):
-                if cape_name and buf["CAPE"]["configs"].get("cape_name", "") == cape_name:
-                    return Response({cape_name.lower(): buf["CAPE"]["configs"][cape_name]})
-                data = buf["CAPE"]["configs"]
-            if data:
-                resp = {"error": False, "configs": data}
-            else:
-                resp = {"error": True, "error_value": "CAPE config for task {} does not exist.".format(task_id)}
-            return Response(resp)
-        else:
-            resp = {"error": True, "error_value": "CAPE config for task {} does not exist.".format(task_id)}
-            return Response(resp)
-    else:
+    if buf and not buf.get("CAPE"):
         resp = {"error": True, "error_value": "Unable to retrieve results for task {}.".format(task_id)}
         return Response(resp)
 
+    if isinstance(buf, dict) and buf.get("CAPE", False):
+        if zlib_compresion:
+            buf["CAPE"] = json.loads(decompress(buf["CAPE"]))
+        data = []
+        if not isinstance(buf["CAPE"], list) and buf["CAPE"].get("configs"):
+            if cape_name and buf["CAPE"]["configs"].get(cape_name, "") == cape_name:
+                return Response({cape_name.lower(): buf["CAPE"]["configs"][cape_name]})
+            data = buf["CAPE"]["configs"]
+        if data:
+            resp = {"error": False, "configs": data}
+        else:
+            resp = {"error": True, "error_value": "CAPE config for task {} does not exist.".format(task_id)}
+        return Response(resp)
+    else:
+        resp = {"error": True, "error_value": "CAPE config for task {} does not exist.".format(task_id)}
+        return Response(resp)
 
-"""
 
 @csrf_exempt
-@api_view(['POST'])
-#should be securized by checking category, this is just an example how easy to extend webgui with external tools
+@api_view(["POST"])
+# should be securized by checking category, this is just an example how easy to extend webgui with external tools
 def post_processing(request, category, task_id):
-
     content = request.data.get("content", "")
     if content and category:
         content = json.loads(content)
         if not content:
             return Response({"error": True, "msg": "Missed content data or category"})
-        buf = results_db.analysis.find_one({"info.id": int(task_id)}, {"_id": 1})
-        if not buf:
-            return Response({"error": True, "msg": "Task id doesn't exist"})
-        results_db.analysis.update({"_id": ObjectId(buf["_id"])}, {"$set": {category: content}})
+        _ = mongo_find_one_and_update("analysis", {"info.id": int(task_id)}, {"$set": {category: content}})
         resp = {"error": False, "msg": "Added under the key {}".format(category)}
     else:
         resp = {"error": True, "msg": "Missed content data or category"}
 
     return Response(resp)
-"""
 
 
 @csrf_exempt
@@ -2033,6 +2764,7 @@ def statistics_data(requests, days):
 @api_view(["POST"])
 def tasks_delete_many(request):
     response = {}
+    delete_mongo = request.POST.get("delete_mongo", True)
     for task_id in request.POST.get("ids", "").split(",") or []:
         task_id = int(task_id)
         task = db.view_task(task_id)
@@ -2042,11 +2774,8 @@ def tasks_delete_many(request):
                 continue
             if db.delete_task(task_id):
                 delete_folder(os.path.join(CUCKOO_ROOT, "storage", "analyses", "%d" % task_id))
-            task = results_db.analysis.find_one({"info.id": task_id})
-            if task is not None:
-                for processes in task.get("behavior", {}).get("processes", []):
-                    [results_db.calls.remove(call) for call in processes.get("calls", [])]
-                results_db.analysis.remove({"info.id": task_id})
+            if delete_mongo:
+                mongo_delete_data(task_id)
         else:
             response.setdefault(task_id, "not exists")
     response["status"] = "OK"
@@ -2056,3 +2785,437 @@ def tasks_delete_many(request):
 def limit_exceeded(request, exception):
     resp = {"error": True, "error_value": "Rate limit exceeded for this API"}
     return Response(resp)
+
+
+dl_service_map = {
+    "VirusTotal": "vtdl",
+}
+
+
+@csrf_exempt
+@api_view(["POST"])
+def tasks_download_services(request):
+    # Check if this API function is enabled
+    if not apiconf.downloading_services.get("enabled"):
+        return Response({"error": True, "error_value": "Download sample API is Disabled"})
+    resp = {}
+    hashes = request.POST.get("hashes").strip()
+    if not hashes:
+        return Response({"error": True, "error_value": "hashes value is empty"})
+    resp["error"] = []
+    # Parse potential POST options (see submission/views.py)
+    options = request.POST.get("options", "")
+    custom = request.POST.get("custom", "")
+    machine = request.POST.get("machine", "")
+    opt_filename = get_user_filename(options, custom)
+
+    details = {}
+    task_machines = []
+    vm_list = []
+    opt_apikey = False
+    opts = get_options(options)
+    if opts:
+        opt_apikey = opts.get("apikey", False)
+
+    for vm in db.list_machines():
+        vm_list.append(vm.label)
+    if machine.lower() == "all":
+        if not apiconf.filecreate.get("allmachines"):
+            resp = {"error": True, "error_value": "Machine=all is disabled using the API"}
+            return Response(resp)
+        for entry in vm_list:
+            task_machines.append(entry)
+    else:
+        # Check if VM is in our machines table
+        if machine == "" or machine in vm_list:
+            task_machines.append(machine)
+        # Error if its not
+        else:
+            resp = {
+                "error": True,
+                "error_value": "Machine '{0}' does not exist. Available: {1}".format(machine, ", ".join(vm_list)),
+            }
+            return Response(resp)
+
+    details = {
+        "errors": [],
+        "content": False,
+        "request": request,
+        "task_id": [],
+        "url": False,
+        "params": {},
+        "headers": {},
+        "path": "",
+        "fhash": False,
+        "options": options,
+        "only_extraction": False,
+        "service": "",
+        "user_id": request.user.id or 0,
+    }
+
+    if opt_apikey:
+        details["apikey"] = opt_apikey
+
+    details = download_from_3rdparty(hashes, opt_filename, details)
+    if isinstance(details.get("task_ids"), list):
+        tasks_count = len(details["task_ids"])
+    else:
+        tasks_count = 0
+    if tasks_count > 0:
+        resp["data"] = {}
+        resp["errors"] = details["errors"]
+        resp["data"]["task_ids"] = details.get("task_ids", [])
+        if len(details.get("task_ids", [])) == 1:
+            resp["data"]["message"] = "Task ID {0} has been submitted".format(str(details.get("task_ids", [])[0]))
+        else:
+            resp["data"]["message"] = "Task IDs {0} have been submitted".format(
+                ", ".join(str(x) for x in details.get("task_ids", []))
+            )
+    else:
+        resp = {"error": True, "error_value": "Error adding task to database", "errors": details["errors"]}
+
+    return Response(resp)
+
+
+@csrf_exempt
+@api_view(["POST"])
+def tasks_file_stream(request, task_id):
+    """Streams a file from the running machine with matching task_id."""
+
+    def _stream_iterator(fp, guest_name, chunk_size=1024):
+        pos = 0
+        while True:
+            machine = db.view_machine(guest_name)
+            if machine.status != "running":
+                break
+            with open(fp, "rb") as fd:
+                if pos:
+                    fd.seek(pos)
+                while True:
+                    content = fd.read(chunk_size)
+                    if not content:
+                        break
+                    yield content
+                    pos = fd.tell()
+
+    if not apiconf.taskstatus.get("enabled"):
+        resp = {"error": True, "error_value": "Task status API is disabled"}
+        return Response(resp)
+    resp = {}
+    try:
+        task = db.view_task(task_id, details=True)
+    except TypeError:
+        task = db.view_task(task_id)
+    if not task:
+        resp = {"error": True, "error_value": "Task does not exist"}
+        return Response(resp)
+    guest = getattr(task, "guest", None)
+    if task.status != TASK_RUNNING or guest is None or not getattr(guest, "name", None):
+        resp = {"error": True, "error_value": "Task is not running"}
+        return Response(resp)
+    machine = db.view_machine(guest.name)
+    if not machine or machine.status != "running":
+        resp = {"error": True, "error_value": "Machine is not running", "errors": getattr(machine, "status", None)}
+        return Response(resp)
+    filepath = request.data.get("filepath")
+    if not filepath:
+        resp = {"error": True, "error_value": "filepath not set"}
+        return Response(resp)
+    if request.data.get("is_local", ""):
+        if filepath.startswith(("/", r"\/")):
+            resp = {"error": True, "error_value": "Filepath mustn't start with /"}
+            return Response(resp)
+        task_dir = os.path.join(CUCKOO_ROOT, "storage", "analyses", f"{task_id}")
+        filepath = os.path.join(task_dir, filepath)
+        abs_task_dir = os.path.abspath(task_dir)
+        abs_filepath = os.path.abspath(filepath)
+        # Inside this task's own directory: "../<other id>/" is another task's (tenant's) files.
+        # Allow CAPE's own per-task symlinks (e.g. `binary`, `dump.pcap`) into `storage/binaries/<hash>`,
+        # while rejecting symlinks that point into another task directory or outside `storage/binaries/`.
+        real_task_dir = os.path.realpath(task_dir)
+        real_filepath = os.path.realpath(filepath)
+        real_binaries_dir = os.path.realpath(os.path.join(CUCKOO_ROOT, "storage", "binaries"))
+        in_task_dir = real_filepath.startswith(real_task_dir + os.sep)
+        in_task_binaries_link = (
+            abs_filepath.startswith(abs_task_dir + os.sep)
+            and os.path.realpath(os.path.dirname(abs_filepath)) == real_task_dir
+            and real_filepath.startswith(real_binaries_dir + os.sep)
+        )
+        if not abs_filepath.startswith(abs_task_dir + os.sep) or not (in_task_dir or in_task_binaries_link):
+            resp = {"error": True, "error_value": "Path traversal detected"}
+            return Response(resp)
+        if not os.path.isfile(filepath):
+            resp = {"error": True, "error_value": "file does not exist"}
+            return Response(resp)
+        return StreamingHttpResponse(
+            streaming_content=_stream_iterator(filepath, guest.name), content_type="application/octet-stream"
+        )
+    try:
+        r = requests.post(f"http://{machine.ip}:8000/retrieve", stream=True, data={"filepath": filepath, "streaming": "1"})
+        if r.status_code >= 400:
+            resp = {"error": True, "error_value": f"{filepath} does not exist"}
+            return Response(resp)
+        return StreamingHttpResponse(streaming_content=r.iter_content(chunk_size=1024), content_type="application/octet-stream")
+    except requests.exceptions.RequestException as ex:
+        log.exception(ex)
+        resp = {"error": True, "error_value": f"Requests exception: {ex}"}
+    return Response(resp)
+
+
+@csrf_exempt
+@api_view(["GET"])
+def dist_tasks_reported(request):
+    # List finished tasks here
+    if not DIST_ENABLED:
+        return Response(
+            {
+                "Error": True,
+                "error_value": "Distributed CAPE is not enabled",
+            }
+        )
+    """
+
+        Add new API endpoint in CAPE to query the tasks that are reported and ready to be retrieved
+        Add new API endpoint in CAPE to set "task.notificated = True" for a specific task
+
+        yeah we could script that go and fetch reported tasks.
+        can you currently list tasks that are finished but waiting to be retrieved in the api?
+        e.g. in the notification_loop() in dist.py, where it queries tasks that need to be sent to the callback url it does this:
+
+        if there was an pi endpoint that exposed that, and another that allowed us to set notificated on the task when we'd finished processing it, then we wouldnt need the callback anymore
+    """
+    stmt = (
+        select(DTask.main_task_id)
+        .where(DTask.finished.is_(True), DTask.retrieved.is_(True), DTask.notificated.is_(False))
+        .order_by(DTask.id.desc())
+    )
+    with dist_session() as dist_db, dist_db.begin():
+        ready = list(dist_db.scalars(stmt).all())
+    return Response({"Tasks": ready})
+
+
+@csrf_exempt
+@api_view(["GET"])
+def dist_tasks_notification(request, task_id: int):
+    with dist_session() as dist_db, dist_db.begin():
+        tasks = dist_db.scalars(select(DTask).where(DTask.main_task_id == task_id).order_by(DTask.id.desc())).all()
+        if not tasks:
+            return Response({"error": True, "error_value": f"No tasks found with main_task_id: {task_id}"})
+        for task in tasks:
+            # main_db.set_status(task.main_task_id, TASK_REPORTED)
+            # log.debug("reporting main_task_id: {}".format(task.main_task_id))
+            task.notificated = True
+    return Response({"error": False, "data": [task_id]})
+
+
+@csrf_exempt
+@api_view(["POST"])
+def yara_uploader(request):
+    try:
+        if not apiconf.yara_uploader.get("enabled"):
+            return Response({"error": True, "error_value": "Yara Uploader API is Disabled"})
+
+        if not HAVE_PLYARA:
+            return Response({"error": True, "error_value": "Missing dependency. Contact your administrator."})
+
+        category = request.data.get("category")
+        if not category or category not in ALLOWED_YARA_CATEGORIES:
+            return Response(
+                {"status": "error", "message": f"Invalid or missing category. Allowed categories: {ALLOWED_YARA_CATEGORIES}"},
+                status=400,
+            )
+        if not getattr(request.user, "is_authenticated", False):
+            raw_user = getattr(getattr(request, "_request", None), "user", None)
+            if getattr(raw_user, "is_authenticated", False):
+                request.user = raw_user
+            elif ApiKeyAuthentication is not None:
+                with suppress(Exception):
+                    auth_res = ApiKeyAuthentication().authenticate(request)
+                    if auth_res:
+                        request.user, request.auth = auth_res
+
+        if apiconf.yara_uploader.get("auth_only", False) and not request.user.is_authenticated:
+            return Response({"status": "error", "message": "Authentication required"}, status=401)
+        if "file" not in request.FILES:
+            return Response({"status": "error", "message": "No file provided"}, status=400)
+
+        uploaded_file = request.FILES["file"]
+
+        # Read content for processing
+        try:
+            content = uploaded_file.read().decode("utf-8")
+        except UnicodeDecodeError:
+            return Response({"status": "error", "message": "File must be a text file (UTF-8)"}, status=400)
+
+        # Validate YARA
+        try:
+            yara.compile(source=content)
+        except yara.SyntaxError as e:
+            return Response({"status": "error", "message": f"YARA Syntax Error: {str(e)}"}, status=400)
+        except yara.Error as e:
+            return Response({"status": "error", "message": f"YARA Error: {str(e)}"}, status=400)
+
+        try:
+            parser = plyara.Plyara()
+            rules = parser.parse_string(content)
+
+            if not rules:
+                return Response({"status": "error", "message": "No YARA rules found in file"}, status=400)
+
+            main_rule = rules[0]
+
+            # Check for family
+            family = None
+            metadata = main_rule.get("metadata", [])
+
+            for meta in metadata:
+                if "family" in meta:
+                    family = meta["family"]
+                    break
+
+            if not family:
+                # Fallback: check cape_type
+                for meta in metadata:
+                    if "cape_type" in meta:
+                        cape_type_val = meta["cape_type"]
+                        if cape_type_val and isinstance(cape_type_val, str):
+                            family = cape_type_val.split(" ")[0]
+                        break
+
+            if not family:
+                return Response({"status": "error", "message": "Missing 'family' in metadata"}, status=400)
+
+            if (
+                not isinstance(family, str)
+                or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}", family)
+                or ".." in family
+            ):
+                return Response({"status": "error", "message": "Invalid family name"}, status=400)
+
+            # Now iterate all rules to inject cape_type / author if needed
+            for rule in rules:
+                rule_metadata = rule.get("metadata", [])
+
+                has_cape_type = any("cape_type" in m for m in rule_metadata)
+                has_author = any("yara_created_by" in m for m in rule_metadata)  # Using yara_created_by as key
+
+                if not has_cape_type:
+                    rule_metadata.append({"cape_type": f"{family} Payload"})
+
+                if request.user.is_authenticated and not has_author:
+                    rule_metadata.append({"yara_created_by": request.user.username})
+
+                rule["metadata"] = rule_metadata
+
+            # Define destination path
+            original_filename = path_get_filename(uploaded_file.name or "")  # Basic safety
+            if category == "monitor":
+                dest_dir = os.path.join(CUCKOO_ROOT, "analyzer", "windows", "data", "yara")
+            else:
+                dest_dir = os.path.join(CUCKOO_ROOT, "data", "yara", category)
+
+            # Ensure directory exists
+            if not os.path.exists(dest_dir):
+                os.makedirs(dest_dir, exist_ok=True)
+
+            original_dest_path = os.path.join(dest_dir, original_filename) if original_filename else ""
+
+            if (
+                original_filename.endswith((".yar", ".yara"))
+                and os.path.isfile(original_dest_path)
+            ):
+                filename = original_filename
+                dest_path = original_dest_path
+            else:
+                # Fallback to standard naming
+                filename = f"{family}.yar"
+                dest_path = os.path.join(dest_dir, filename)
+
+            dest_path_real = os.path.realpath(dest_path)
+            dest_dir_real = os.path.realpath(dest_dir)
+            if os.path.dirname(dest_path_real) != dest_dir_real:
+                return Response({"status": "error", "message": "Invalid destination path"}, status=400)
+
+            # Check if file exists to append
+            if os.path.exists(dest_path):
+                with open(dest_path, "r", encoding="utf-8") as f:
+                    existing_content = f.read()
+
+                try:
+                    existing_rules = parser.parse_string(existing_content)
+                    existing_names = {r["rule_name"] for r in existing_rules}
+
+                    # Filter new rules
+                    unique_rules = []
+                    for rule in rules:
+                        if rule["rule_name"] not in existing_names:
+                            unique_rules.append(rule)
+
+                    if not unique_rules:
+                        # No new rules to add
+                        msg = "All rules already exist. Nothing to add."
+                        return Response({"status": "success", "message": msg})
+
+                    append_content = ""
+                    for rule in unique_rules:
+                        append_content += "\n\n" + plyara.utils.rebuild_yara_rule(rule)
+
+                    content = existing_content + append_content
+
+                except Exception as e:
+                    return Response({"status": "error", "message": f"Failed to parse existing file for append: {str(e)}"}, status=500)
+            else:
+                # Rebuild content for new file
+                new_content = ""
+                for rule in rules:
+                    new_content += plyara.utils.rebuild_yara_rule(rule) + "\n\n"
+
+                content = new_content
+
+        except Exception as e:
+            return Response({"status": "error", "message": f"Plyara parsing error: {str(e)}"}, status=400)
+
+        # Save file
+        with open(dest_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        msg = "Rule saved! Thank you"
+
+        # Distributed propagation
+        try:
+            if DIST_ENABLED:
+                # Prepare for propagation
+                files = {"file": (filename, content)}
+                with dist_session() as db_session:
+                    nodes = db_session.execute(select(Node).where(Node.enabled.is_(True))).scalars().all()
+
+                    propagated_count = 0
+                    total_count = 0
+
+                    for node in nodes:
+                        total_count += 1
+                        prop_url = urljoin(node.url, "apiv2/yara_uploader/")
+                        headers = {"Authorization": f"Token {node.apikey}"}
+
+                        try:
+                            data = {"username": request.user.username, "category": category}
+                            r = requests.post(prop_url, files=files, data=data, headers=headers, verify=False, timeout=10)
+                            if r.status_code == 200:
+                                propagated_count += 1
+                        except Exception:
+                            pass
+
+                    msg += f" (Propagated to {propagated_count}/{total_count} workers)"
+
+        except Exception as e:
+            msg += f" (Propagation failed: {str(e)})"
+
+        return Response(
+            {
+                "status": "success",
+                "message": msg,
+            }
+        )
+
+    except Exception as e:
+        return Response({"status": "error", "message": str(e)}, status=500)

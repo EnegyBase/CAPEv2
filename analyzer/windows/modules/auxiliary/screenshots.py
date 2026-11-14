@@ -1,30 +1,32 @@
 # Copyright (C) 2010-2015 Cuckoo Foundation.
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
-from __future__ import absolute_import
+
 import logging
-
-log = logging.getLogger(__name__)
-
-log.debug("Importing 'time'")
+import os
 import time
-
-log.debug("Importing 'StringIO'")
+from contextlib import suppress
 from io import BytesIO
-
-log.debug("Importing 'Thread'")
 from threading import Thread
 
-log.debug("Importing 'Auxiliary'")
-from lib.common.abstracts import Auxiliary
+try:
+    from PIL import Image
+except ImportError:
+    pass
 
-log.debug("Importing 'NetlogFile'")
+from lib.api.screenshot import Screenshot
+from lib.common.abstracts import Auxiliary
 from lib.common.results import NetlogFile
 
-log.debug("Importing 'Screenshot'")
-from lib.api.screenshot import Screenshot
+HAVE_CV2 = False
+with suppress(ImportError):
+    import cv2
+    import numpy as np
 
-log.debug("Imports OK")
+    HAVE_CV2 = True
+
+
+log = logging.getLogger(__name__)
 
 SHOT_DELAY = 1
 # Skip the following area when comparing screen shots.
@@ -33,13 +35,35 @@ SHOT_DELAY = 1
 SKIP_AREA = None
 
 
+def handle_qr_codes(image_data):
+    """Extract URL from QR code if present."""
+    if not HAVE_CV2:
+        return None
+
+    try:
+        image = Image.open(image_data)
+        # Convert PIL image to BGR numpy array for OpenCV
+        img = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+        detector = cv2.QRCodeDetector()
+        extracted, _, _ = detector.detectAndDecode(img)
+        # Simple URL detection
+        if extracted and "://" in extracted[:10]:
+            return extracted
+    except Exception as e:
+        log.debug("Error in handle_qr_codes: %s", e)
+
+    return None
+
+
 class Screenshots(Auxiliary, Thread):
     """Take screenshots."""
 
     def __init__(self, options, config):
         Auxiliary.__init__(self, options, config)
         Thread.__init__(self)
-        self.do_run = True
+        self.enabled = config.screenshots_windows
+        self.screenshots_qr = getattr(config, "screenshots_qr", False)
+        self.do_run = self.enabled
 
     def stop(self):
         """Stop screenshotting."""
@@ -50,7 +74,7 @@ class Screenshots(Auxiliary, Thread):
         @return: operation status.
         """
         if not Screenshot().have_pil():
-            log.warning("Python Image Library is not installed, " "screenshots are disabled")
+            log.warning("Python Image Library is not installed, screenshots are disabled")
             return False
 
         img_counter = 0
@@ -65,22 +89,30 @@ class Screenshots(Auxiliary, Thread):
                 log.error("Cannot take screenshot: %s", e)
                 continue
 
-            if img_last:
-                if Screenshot().equal(img_last, img_current, SKIP_AREA):
-                    continue
+            if img_last and Screenshot().equal(img_last, img_current, SKIP_AREA):
+                continue
 
             img_counter += 1
             # workaround as PIL can't write to the socket file object :(
-            tmpio = BytesIO()
-            img_current.save(tmpio, format="JPEG")
-            tmpio.seek(0)
+            with BytesIO() as tmpio:
+                img_current.save(tmpio, format="JPEG")
+                tmpio.seek(0)
 
-            # now upload to host from the StringIO
-            nf = NetlogFile()
-            nf.init("shots/%s.jpg" % str(img_counter).rjust(4, "0"))
-            for chunk in tmpio:
-                nf.sock.send(chunk)
-            nf.close()
-            img_last = img_current
+                if self.screenshots_qr and HAVE_CV2:
+                    url = handle_qr_codes(tmpio)
+                    if url:
+                        log.info("QR code detected with URL: %s", url)
+                        try:
+                            # os.startfile is Windows only and usually works for URLs
+                            os.startfile(url)
+                        except Exception as e:
+                            log.error("Failed to open QR URL: %s", e)
+                    tmpio.seek(0)
+
+                nf = NetlogFile()
+                nf.init(f"shots/{str(img_counter).rjust(4, '0')}.jpg")
+                nf.send_fileobj(tmpio)
+                nf.close()
+                img_last = img_current
 
         return True

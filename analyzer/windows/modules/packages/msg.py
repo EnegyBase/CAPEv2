@@ -2,7 +2,6 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 from lib.common.abstracts import Package
 
 
@@ -14,7 +13,9 @@ class MSG(Package):
         ("ProgramFiles", "Microsoft Office", "Office*", "OUTLOOK.EXE"),
         ("ProgramFiles", "Microsoft Office*", "root", "Office*", "OUTLOOK.EXE"),
     ]
+    summary = "Opens a .msg file with MS Outlook."
+    description = """Uses 'OUTLOOK.EXE /f <sample>' to open a .msg file."""
 
     def start(self, path):
-        outlook = self.get_path_glob("Microsoft Office Outlook")
-        return self.execute(outlook, '/f "%s"' % path, path)
+        outlook = self.get_path_glob("OUTLOOK.EXE")
+        return self.execute(outlook, f'/f "{path}"', path)

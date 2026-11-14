@@ -2,10 +2,10 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import absolute_import
 import os
 
 from lib.common.abstracts import Package
+from lib.common.constants import OPT_FREE
 
 
 class JS(Package):
@@ -14,34 +14,38 @@ class JS(Package):
     PATHS = [
         ("SystemRoot", "system32", "wscript.exe"),
     ]
+    summary = "Executes a .JS file using wscript.exe."
+    description = """Uses 'wscript.exe <sample>' to run a .js/.jse file.
+    In the case of '.jse' files, first start up 20 calc.exe windows, to thwart
+    some anti-vm measures.
+    The appropriate file extension will be added automatically."""
 
     def start(self, path):
         wscript = self.get_path("wscript.exe")
-        args = '"%s"' % path
         ext = os.path.splitext(path)[-1].lower()
-        if ext != ".js" and ext != ".jse":
-            if ext == ".jse" or (os.path.isfile(path) and "#@~^" == open(path, "rt").read(4)):
+        if ext not in (".js", ".jse"):
+            if ext == ".jse" or os.path.isfile(path) and open(path, "rt").read(4) == "#@~^":
                 if ext != ".jse":
-                    os.rename(path, path + ".jse")
-                    path = path + ".jse"
+                    os.rename(path, f"{path}.jse")
+                    path = f"{path}.jse"
                     ext = ".jse"
             else:
-                os.rename(path, path + ".js")
-                path = path + ".js"
+                os.rename(path, f"{path}.js")
+                path = f"{path}.js"
 
         if ext == ".jse":
             # antivm fix
-            free = self.options.get("free", False)
+            free = self.options.get(OPT_FREE, False)
             # to not track calcs
-            self.options["free"] = 1
+            self.options[OPT_FREE] = 1
             # fuck antivm
-            for i in range(20):
+            for _ in range(20):
                 # calc
-                calc = os.path.join("c:\\windows", "system32", "calc.exe")
+                calc = os.path.join("C:\\windows", "system32", "calc.exe")
                 # cl = Process()
                 self.execute(calc, "", path)
-            if free is False:
-                self.options["free"] = 0
+            if not free:
+                self.options[OPT_FREE] = 0
 
-        args = '"%s"' % path
+        args = f'"{path}"'
         return self.execute(wscript, args, path)

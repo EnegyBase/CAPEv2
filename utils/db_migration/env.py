@@ -2,15 +2,12 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 
-from __future__ import with_statement
-
-from __future__ import absolute_import
 import os.path
 import sys
+from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import create_engine, pool
-from logging.config import fileConfig
 
 # This is the Alembic Config object, which provides access to the values within
 # the .ini file in use.
@@ -24,10 +21,10 @@ fileConfig(config.config_file_name)
 curdir = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(os.path.join(curdir, "..", ".."))
 
-from lib.cuckoo.core.database import Base, Database
+from lib.cuckoo.core.database import Base, _Database
 
 # Get database connection string from cuckoo configuration.
-url = Database(schema_check=False).engine.url.__to_string__(hide_password=False)
+url = _Database(schema_check=False).engine.url.__to_string__(hide_password=False)
 target_metadata = Base.metadata
 
 

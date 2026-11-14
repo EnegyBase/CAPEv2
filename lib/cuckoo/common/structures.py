@@ -15,7 +15,7 @@ class Structure(ctypes.Structure):
             elif hasattr(value, "value"):
                 ret[field] = value
             elif hasattr(value, "__getitem__"):
-                ret[field] = value[:]
+                ret[field] = value.copy()
             else:
                 ret[field] = value
         return ret
@@ -50,6 +50,7 @@ class LnkEntry(Structure):
 
 
 class PUBLICKEYSTRUC(Structure):
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = [
         ("type", ctypes.c_ubyte),
@@ -60,6 +61,7 @@ class PUBLICKEYSTRUC(Structure):
 
 
 class RSAPUBKEY(Structure):
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = [
         ("magic", ctypes.c_uint),

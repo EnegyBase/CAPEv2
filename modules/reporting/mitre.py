@@ -1,5 +1,13 @@
-from __future__ import absolute_import
+# Copyright (C) 2010-2015 Cuckoo Foundation.
+# This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
+# See the file 'docs/LICENSE' for copying permission.
+
+import logging
+
 from lib.cuckoo.common.abstracts import Report
+from lib.cuckoo.common.integrations.mitre import mitre_generate_attck
+
+log = logging.getLogger(__name__)
 
 
 class MITRE_TTPS(Report):
@@ -7,19 +15,6 @@ class MITRE_TTPS(Report):
         if not results.get("ttps") or not hasattr(self, "mitre"):
             return
 
-        attck = dict()
-        ttps = list(results["ttps"].keys())
-        for technique in self.mitre.enterprise.techniques:
-            if technique.id in ttps:
-                for tactic in technique.tactics:
-                    attck.setdefault(tactic.name, list())
-                    attck[tactic.name].append(
-                        {
-                            "t_id": technique.id,
-                            "ttp_name": technique.name,
-                            "description": technique.description,
-                            "signature": results["ttps"][technique.id],
-                        }
-                    )
+        attck = mitre_generate_attck(results, self.mitre)
         if attck:
             results["mitre_attck"] = attck
